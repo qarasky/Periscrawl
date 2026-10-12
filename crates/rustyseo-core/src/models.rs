@@ -46,6 +46,12 @@ pub struct CrawlerConfig {
     /// Honor robots.txt Crawl-delay directives (slower, politer crawls).
     #[serde(default)]
     pub respect_crawl_delay: bool,
+    /// Do not follow links marked rel="nofollow".
+    #[serde(default)]
+    pub respect_nofollow: bool,
+    /// Do not follow links found on noindex pages (meta robots or X-Robots-Tag).
+    #[serde(default)]
+    pub respect_noindex: bool,
 }
 
 fn default_true() -> bool {
@@ -125,6 +131,8 @@ impl Default for AppSettings {
                 check_external_links: false,
                 respect_robots: true,
                 respect_crawl_delay: false,
+                respect_nofollow: false,
+                respect_noindex: false,
             },
             ui: UiConfig {
                 theme: "Oceanic".to_string(),

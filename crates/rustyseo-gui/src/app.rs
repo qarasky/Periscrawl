@@ -1,13 +1,17 @@
-//! Application state and background jobs (crawls, session loads, exports).
+//! Application state and background jobs (crawls, session loads, diffs, exports).
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::Instant;
 
 use rustyseo_core::crawler::stats::CrawlStats;
 use rustyseo_core::crawler::{CrawlEngine, CrawlMessage};
 use rustyseo_core::db::{self, SessionRow};
+use rustyseo_core::diff::{self, DiffEntry, DiffStats};
 use rustyseo_core::export::{self, Sheet};
-use rustyseo_core::models::AppSettings;
+use rustyseo_core::helpers::issues::IssueAnalyzer;
+use rustyseo_core::models::{AppSettings, PageSummary};
+use rustyseo_core::PageData;
 
 pub struct CrawlForm {
     pub url: String,
@@ -61,6 +65,8 @@ pub struct LiveCrawl {
 
 pub struct LoadedSession {
     pub session_id: i64,
+    pub pages: Vec<PageData>,
+    pub summaries: Vec<PageSummary>,
     pub sheets: Vec<Sheet>,
     pub page_count: usize,
 }
@@ -72,13 +78,76 @@ pub enum ExportKind {
     Json,
 }
 
+/// Which view the central panel shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CentralTab {
+    Sheet(usize),
+    Diff,
+}
+
+/// The right-hand inspector contents.
+#[derive(Clone)]
+pub enum DetailView {
+    Page { index: usize },
+    Asset { kind: AssetKind, url: String },
+    Issue { name: String },
+    DiffEntry { index: usize },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    Images,
+    Css,
+    JavaScript,
+    Files,
+}
+
+impl AssetKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            AssetKind::Images => "Image",
+            AssetKind::Css => "CSS file",
+            AssetKind::JavaScript => "JavaScript file",
+            AssetKind::Files => "File",
+        }
+    }
+
+    /// URLs of this asset kind that a page references.
+    pub fn urls_for<'a>(self, page: &'a PageData) -> Vec<&'a str> {
+        match self {
+            AssetKind::Images => page.images.iter().map(|i| i.src.as_str()).collect(),
+            AssetKind::Css => page
+                .css
+                .as_ref()
+                .map(|c| c.css_urls.iter().map(|u| u.as_str()).collect())
+                .unwrap_or_default(),
+            AssetKind::JavaScript => page
+                .javascript
+                .as_ref()
+                .map(|j| j.js_urls.iter().map(|u| u.as_str()).collect())
+                .unwrap_or_default(),
+            AssetKind::Files => page
+                .anchor_links
+                .iter()
+                .filter(|l| export::is_file_url(&l.href))
+                .map(|l| l.href.as_str())
+                .collect(),
+        }
+    }
+}
+
 pub struct RustySeoApp {
     pub runtime: tokio::runtime::Runtime,
     pub sessions: Vec<SessionRow>,
     pub selected_session: Option<i64>,
+    pub pages: Vec<PageData>,
+    pub summaries: Vec<PageSummary>,
+    page_lookup: HashMap<String, usize>,
     pub sheets: Vec<Sheet>,
-    pub active_tab: usize,
+    pub active_tab: CentralTab,
+    pub active_sort: Option<(usize, bool)>,
     pub filter: String,
+    pub detail: Option<DetailView>,
     pub loading_session: bool,
     pub load_rx: Option<Receiver<LoadedSession>>,
     pub status: String,
@@ -86,6 +155,14 @@ pub struct RustySeoApp {
     status_rx: Receiver<String>,
     pub form: CrawlForm,
     pub crawl: Option<LiveCrawl>,
+    pub diff_with: Option<i64>,
+    pub diff_entries: Vec<DiffEntry>,
+    pub diff_stats: Option<DiffStats>,
+    pub diff_loading: bool,
+    pub diff_rx: Option<Receiver<(Vec<DiffEntry>, DiffStats)>>,
+    pub settings_open: bool,
+    pub settings_draft: AppSettings,
+    pub log_path: std::path::PathBuf,
 }
 
 impl RustySeoApp {
@@ -100,14 +177,20 @@ impl RustySeoApp {
             .expect("failed to start tokio runtime");
 
         let (status_tx, status_rx) = channel();
+        let log_path = db::get_db_path().with_file_name("gui.log");
 
         let mut app = Self {
             runtime,
             sessions: Vec::new(),
             selected_session: None,
+            pages: Vec::new(),
+            summaries: Vec::new(),
+            page_lookup: HashMap::new(),
             sheets: Vec::new(),
-            active_tab: 0,
+            active_tab: CentralTab::Sheet(0),
+            active_sort: None,
             filter: String::new(),
+            detail: None,
             loading_session: false,
             load_rx: None,
             status: "Ready. Enter a URL and start a crawl, or pick a session.".to_string(),
@@ -121,8 +204,23 @@ impl RustySeoApp {
                 javascript: settings.crawler.enable_javascript,
             },
             crawl: None,
+            diff_with: None,
+            diff_entries: Vec::new(),
+            diff_stats: None,
+            diff_loading: false,
+            diff_rx: None,
+            settings_open: false,
+            settings_draft: settings,
+            log_path,
         };
         app.refresh_sessions();
+        // Testing/automation hook: auto-open a session, e.g.
+        // RUSTYSEO_GUI_OPEN_SESSION=2 rustyseo-gui
+        if let Ok(id) = std::env::var("RUSTYSEO_GUI_OPEN_SESSION") {
+            if let Ok(id) = id.parse::<i64>() {
+                app.load_session(id);
+            }
+        }
         app
     }
 
@@ -131,6 +229,30 @@ impl RustySeoApp {
             Ok(sessions) => self.sessions = sessions,
             Err(err) => self.status = format!("Could not list sessions: {err}"),
         }
+    }
+
+    /// Resolve a page URL to its index in the loaded session.
+    pub fn resolve_page(&self, url: &str) -> Option<usize> {
+        self.page_lookup.get(url).copied()
+    }
+
+    /// All pages that reference the given asset.
+    pub fn asset_users(&self, kind: AssetKind, url: &str) -> Vec<usize> {
+        self.pages
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| kind.urls_for(page).iter().any(|u| *u == url))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Full URL list for an issue (recomputed from the analyzers).
+    pub fn issue_urls(&self, name: &str) -> Vec<String> {
+        IssueAnalyzer::get_handlers()
+            .iter()
+            .find(|handler| handler.name.trim() == name)
+            .map(|handler| (handler.process)(&self.summaries).1)
+            .unwrap_or_default()
     }
 
     pub fn start_crawl(&mut self) {
@@ -183,6 +305,8 @@ impl RustySeoApp {
                 .with_concurrency(concurrency)
                 .with_robots(settings.crawler.respect_robots)
                 .with_crawl_delay(settings.crawler.respect_crawl_delay)
+                .with_nofollow(settings.crawler.respect_nofollow)
+                .with_noindex(settings.crawler.respect_noindex)
                 .with_javascript(js)
                 .with_db_persistence(None);
             if let Some(sid) = session_id {
@@ -261,8 +385,16 @@ impl RustySeoApp {
         self.selected_session = Some(id);
         self.loading_session = true;
         self.sheets.clear();
+        self.pages.clear();
+        self.summaries.clear();
+        self.page_lookup.clear();
         self.filter.clear();
-        self.active_tab = 0;
+        self.detail = None;
+        self.active_tab = CentralTab::Sheet(0);
+        self.active_sort = None;
+        self.diff_with = None;
+        self.diff_entries.clear();
+        self.diff_stats = None;
 
         let (tx, rx) = channel();
         self.load_rx = Some(rx);
@@ -273,13 +405,64 @@ impl RustySeoApp {
                     .ok()
                     .and_then(|u| u.host_str().map(|h| h.to_string()))
             });
+            let summaries: Vec<PageSummary> = pages
+                .iter()
+                .map(|page| page.summarize(base_domain.as_deref()))
+                .collect();
             let sheets = export::build_report_sheets(&pages, base_domain.as_deref());
             let _ = tx.send(LoadedSession {
                 session_id: id,
-                sheets,
                 page_count: pages.len(),
+                pages,
+                summaries,
+                sheets,
             });
         });
+    }
+
+    pub fn start_diff(&mut self, other: i64) {
+        if self.summaries.is_empty() {
+            self.status = "Load a session first".to_string();
+            return;
+        }
+        self.diff_loading = true;
+        self.diff_entries.clear();
+        self.diff_stats = None;
+
+        let (tx, rx) = channel();
+        self.diff_rx = Some(rx);
+        let new_summaries = self.summaries.clone();
+        std::thread::spawn(move || {
+            let old_pages = db::load_session_pages(other).unwrap_or_default();
+            let base_domain = db::get_session(other).ok().flatten().and_then(|session| {
+                url::Url::parse(&session.start_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+            });
+            let old_summaries: Vec<PageSummary> = old_pages
+                .iter()
+                .map(|page| page.summarize(base_domain.as_deref()))
+                .collect();
+            let (entries, stats) = diff::diff_sessions(&old_summaries, &new_summaries);
+            let _ = tx.send((entries, stats));
+        });
+    }
+
+    pub fn open_settings(&mut self) {
+        self.settings_draft = AppSettings::load();
+        self.settings_open = true;
+    }
+
+    pub fn save_settings_draft(&mut self) {
+        match rustyseo_core::settings::utils::write::save_settings(&self.settings_draft) {
+            Ok(path) => {
+                self.status = format!("Settings saved: {}", path.display());
+                self.form.max_pages = self.settings_draft.crawler.max_pages;
+                self.form.concurrency = self.settings_draft.crawler.concurrency;
+                self.form.javascript = self.settings_draft.crawler.enable_javascript;
+            }
+            Err(err) => self.status = format!("Could not save settings: {err}"),
+        }
     }
 
     pub fn export_current(&mut self, kind: ExportKind) {
@@ -340,8 +523,16 @@ impl RustySeoApp {
                 Ok(loaded) => {
                     self.loading_session = false;
                     self.load_rx = None;
+                    self.page_lookup = loaded
+                        .pages
+                        .iter()
+                        .enumerate()
+                        .map(|(index, page)| (page.url.clone(), index))
+                        .collect();
+                    self.pages = loaded.pages;
+                    self.summaries = loaded.summaries;
                     self.sheets = loaded.sheets;
-                    self.active_tab = 0;
+                    self.active_tab = CentralTab::Sheet(0);
                     self.status = format!(
                         "Loaded session {} ({} stored pages)",
                         loaded.session_id, loaded.page_count
@@ -352,6 +543,27 @@ impl RustySeoApp {
                     self.loading_session = false;
                     self.load_rx = None;
                     self.status = "Session load failed".to_string();
+                }
+            }
+        }
+
+        if let Some(rx) = &self.diff_rx {
+            match rx.try_recv() {
+                Ok((entries, stats)) => {
+                    self.diff_loading = false;
+                    self.diff_rx = None;
+                    self.status = format!(
+                        "Diff ready: {} added, {} removed, {} changed, {} unchanged",
+                        stats.added, stats.removed, stats.changed, stats.unchanged
+                    );
+                    self.diff_entries = entries;
+                    self.diff_stats = Some(stats);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.diff_loading = false;
+                    self.diff_rx = None;
+                    self.status = "Diff failed".to_string();
                 }
             }
         }
@@ -432,7 +644,7 @@ impl RustySeoApp {
 impl eframe::App for RustySeoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
-        if self.crawl.is_some() || self.loading_session {
+        if self.crawl.is_some() || self.loading_session || self.diff_loading {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }

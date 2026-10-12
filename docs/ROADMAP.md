@@ -53,10 +53,15 @@ Rules:
 
 - [x] GUI crate: session browser, crawl form, live crawl view (progress + page stream),
       per-sheet data tables with text filtering, export buttons (xlsx / CSVs / json)
-- [ ] Page detail pane (click a row), CWV and Content tabs, column sorting
-- [ ] Issue audit: severity levels + filtering
-- [ ] Crawl diff view (compare two sessions)
-- [ ] Settings & connectors screens
+- [x] Horizontal scrolling for wide tables; clickable columns headers with sorting
+- [x] Deduplicated asset sheets (Images/CSS/JS/Files list each asset once with
+      "Pages Using" counts); where-used lists in the detail pane
+- [x] CWV and Content tabs (new core sheet builders)
+- [x] Page detail pane (headings, meta, canonicals, links, images, schema, extraction)
+- [x] Issue audit with severities (critical/warning/notice) + full per-issue URL lists
+- [x] Crawl diff view (compare two sessions: added/removed/changed pages + field diffs)
+- [x] Settings & connectors screen (crawler defaults, robots/nofollow/noindex, API keys)
+- [x] File logging for GUI runs (`.../rustyseo/gui.log`)
 - [ ] Packaged app bundles (macOS .app / Windows .exe / Linux) with icons
 
 ### Phase 4 — Sync + agent-native

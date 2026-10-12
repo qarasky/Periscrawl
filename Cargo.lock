@@ -4431,6 +4431,7 @@ dependencies = [
  "rustyseo-core",
  "serde_json",
  "tokio",
+ "tracing-subscriber",
  "url",
 ]
 

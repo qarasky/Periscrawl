@@ -19,7 +19,7 @@ use serde_json::json;
 
 use rustyseo_core::crawler::{CrawlEngine, CrawlMessage};
 use rustyseo_core::db;
-use rustyseo_core::helpers::issues::IssueAnalyzer;
+use rustyseo_core::helpers::issues::{IssueAnalyzer, severity_for};
 use rustyseo_core::models::AppSettings;
 
 #[derive(Parser)]
@@ -230,7 +230,9 @@ async fn crawl(
         .with_max_pages(effective_max_pages)
         .with_concurrency(concurrency.unwrap_or(settings.crawler.concurrency))
         .with_robots(settings.crawler.respect_robots)
-        .with_crawl_delay(settings.crawler.respect_crawl_delay);
+        .with_crawl_delay(settings.crawler.respect_crawl_delay)
+        .with_nofollow(settings.crawler.respect_nofollow)
+        .with_noindex(settings.crawler.respect_noindex);
 
     if js {
         engine = engine.with_javascript(true);
@@ -466,6 +468,7 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
                 if count > 0 {
                     findings.push(json!({
                         "issue": handler.name.trim(),
+                        "severity": severity_for(handler.name).as_str(),
                         "count": count,
                         "urls": urls.iter().take(max_urls).collect::<Vec<_>>(),
                     }));
@@ -490,8 +493,9 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
                 );
                 for finding in &findings {
                     let name = finding["issue"].as_str().unwrap_or("?");
+                    let severity = finding["severity"].as_str().unwrap_or("notice");
                     let count = finding["count"].as_u64().unwrap_or(0);
-                    println!("  {name}: {count}");
+                    println!("  [{severity}] {name}: {count}");
                     if let Some(urls) = finding["urls"].as_array() {
                         for url in urls.iter().take(2) {
                             println!("      {}", url.as_str().unwrap_or(""));

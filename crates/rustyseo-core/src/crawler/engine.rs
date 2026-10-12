@@ -39,6 +39,10 @@ pub struct CrawlEngine {
     respect_robots: bool,
     /// Honor robots.txt Crawl-delay directives.
     respect_crawl_delay: bool,
+    /// Do not follow rel="nofollow" links.
+    respect_nofollow: bool,
+    /// Do not follow links discovered on noindex pages.
+    respect_noindex: bool,
     /// Shared adaptive pacing for outgoing requests (429/5xx aware).
     rate_limiter: Arc<AdaptiveRateLimiter>,
 }
@@ -98,6 +102,8 @@ impl CrawlEngine {
             session_id: None,
             respect_robots: true,
             respect_crawl_delay: false,
+            respect_nofollow: false,
+            respect_noindex: false,
             rate_limiter: Arc::new(AdaptiveRateLimiter::default_polite()),
         }
     }
@@ -169,6 +175,18 @@ impl CrawlEngine {
     /// Honor robots.txt Crawl-delay directives (default: off).
     pub fn with_crawl_delay(mut self, respect: bool) -> Self {
         self.respect_crawl_delay = respect;
+        self
+    }
+
+    /// Do not follow links marked rel="nofollow".
+    pub fn with_nofollow(mut self, respect: bool) -> Self {
+        self.respect_nofollow = respect;
+        self
+    }
+
+    /// Do not follow links found on noindex pages (meta robots / X-Robots-Tag).
+    pub fn with_noindex(mut self, respect: bool) -> Self {
+        self.respect_noindex = respect;
         self
     }
 
@@ -447,15 +465,32 @@ impl CrawlEngine {
                         // Only add new links if we haven't reached max successful crawls
                         if current_success < self.max_pages {
                             let mut new_links = Vec::new();
-                            let filtered_count = 0;
+                            let mut filtered_count = 0;
                             let mut duplicate_count = 0;
                             let normalization_failed = 0;
 
+                            // Optionally do not follow links found on noindex pages.
+                            let skip_links = self.respect_noindex && page_is_noindex(&data);
+                            if skip_links {
+                                tracing::debug!(
+                                    "[NOINDEX] Not following links from noindex page: {}",
+                                    current_url
+                                );
+                                filtered_count += data.anchor_links.len();
+                            }
+
                             let mut added_count = 0;
-                            {
+                            if !skip_links {
                                 let mut visited = self.visited.lock().await; // Lock once
 
                                 for link in &data.anchor_links {
+                                    // Respect rel="nofollow" when configured to.
+                                    if self.respect_nofollow
+                                        && link.rel.to_lowercase().contains("nofollow")
+                                    {
+                                        filtered_count += 1;
+                                        continue;
+                                    }
                                     // Links are already normalized and filtered by fetch_and_process
 
                                     if visited.contains(&link.href) {
@@ -600,4 +635,15 @@ impl CrawlEngine {
             self.flush_pending_pages().await;
         }
     }
+}
+
+/// True when a page asks not to be indexed (meta robots or X-Robots-Tag header).
+fn page_is_noindex(data: &PageData) -> bool {
+    if data.indexability.to_lowercase().contains("noindex") {
+        return true;
+    }
+    data.headers.iter().any(|h| {
+        let lower = h.to_lowercase();
+        lower.starts_with("x-robots-tag") && lower.contains("noindex")
+    })
 }

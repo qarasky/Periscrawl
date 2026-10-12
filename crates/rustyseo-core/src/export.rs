@@ -1,8 +1,11 @@
 //! Session export: turns crawl results into spreadsheet/CSV/JSON deliverables.
 //!
 //! The sheet builders work from typed [`PageData`](crate::crawler::PageData), so
-//! every frontend (CLI now, GUI/TUI later) produces identical exports.
+//! every frontend (CLI, GUI, TUI) produces identical exports. Asset sheets
+//! (Images, CSS, JavaScript, Files) list each asset once with usage counts —
+//! per-page references live in the page detail views of the apps.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +14,7 @@ use directories::ProjectDirs;
 use rust_xlsxwriter::{Format, Workbook};
 
 use crate::crawler::PageData;
-use crate::helpers::issues::IssueAnalyzer;
+use crate::helpers::issues::{IssueAnalyzer, severity_for};
 
 /// One exportable table. Column order in `header` matches every row.
 #[derive(Debug, Clone)]
@@ -52,6 +55,44 @@ pub fn build_report_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec
     sheets
 }
 
+/// Aggregate of one asset (image/css/js/file) across the whole crawl.
+struct AssetAgg {
+    pages_using: usize,
+    /// Images: references missing alt text. CSS/JS: external resource count. Files: unused.
+    extra: usize,
+    /// Images: formatted size. CSS/JS: page total size. Files: unused.
+    info: String,
+    sample_pages: Vec<String>,
+}
+
+impl AssetAgg {
+    fn new(info: String) -> Self {
+        Self {
+            pages_using: 0,
+            extra: 0,
+            info,
+            sample_pages: Vec::new(),
+        }
+    }
+
+    fn add_page(&mut self, page_url: &str) {
+        self.pages_using += 1;
+        if self.sample_pages.len() < 3 {
+            self.sample_pages.push(page_url.to_string());
+        }
+    }
+}
+
+fn sorted_asset_rows(agg: HashMap<String, AssetAgg>) -> Vec<(String, AssetAgg)> {
+    let mut rows: Vec<(String, AssetAgg)> = agg.into_iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.pages_using
+            .cmp(&a.1.pages_using)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    rows
+}
+
 /// Data sheets derived purely from page records.
 pub fn session_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec<Sheet> {
     let mut overview = Sheet::new(
@@ -69,10 +110,11 @@ pub fn session_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec<Shee
         "Redirects",
         &["Page", "Hop", "Redirect URL", "Hop Status", "Final Status"],
     );
-    let mut images = Sheet::new("Images", &["Page", "Image URL", "Alt Text", "Size"]);
-    let mut css = Sheet::new("CSS", &["Page", "CSS URL", "Page CSS Total", "External Count"]);
-    let mut js = Sheet::new("JavaScript", &["Page", "JS URL", "Page JS Total", "External Count"]);
-    let mut files = Sheet::new("Files", &["Page", "File URL", "Anchor Text"]);
+
+    let mut images_agg: HashMap<String, AssetAgg> = HashMap::new();
+    let mut css_agg: HashMap<String, AssetAgg> = HashMap::new();
+    let mut js_agg: HashMap<String, AssetAgg> = HashMap::new();
+    let mut files_agg: HashMap<String, AssetAgg> = HashMap::new();
 
     for page in pages {
         let summary = page.summarize(base_domain);
@@ -125,7 +167,10 @@ pub fn session_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec<Shee
             }
 
             if file_extension(&link.href).is_some() {
-                files.push(vec![page.url.clone(), link.href.clone(), link.text.clone()]);
+                let entry = files_agg
+                    .entry(link.href.clone())
+                    .or_insert_with(|| AssetAgg::new(String::new()));
+                entry.add_page(&page.url);
             }
         }
 
@@ -140,53 +185,213 @@ pub fn session_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec<Shee
         }
 
         for image in &page.images {
-            images.push(vec![
-                page.url.clone(),
-                image.src.clone(),
-                image.alt.clone(),
-                image.size_formatted.clone(),
-            ]);
+            let entry = images_agg
+                .entry(image.src.clone())
+                .or_insert_with(|| AssetAgg::new(image.size_formatted.clone()));
+            entry.add_page(&page.url);
+            if image.alt.trim().is_empty() {
+                entry.extra += 1;
+            }
         }
 
         if let Some(css_info) = &page.css {
             for url in &css_info.css_urls {
-                css.push(vec![
-                    page.url.clone(),
-                    url.clone(),
-                    css_info.total_size_formatted.clone(),
-                    css_info.external_css_count.to_string(),
-                ]);
+                let entry = css_agg
+                    .entry(url.clone())
+                    .or_insert_with(|| AssetAgg::new(css_info.total_size_formatted.clone()));
+                entry.add_page(&page.url);
+                entry.extra = css_info.external_css_count;
             }
         }
 
         if let Some(js_info) = &page.javascript {
             for url in &js_info.js_urls {
-                js.push(vec![
-                    page.url.clone(),
-                    url.clone(),
-                    js_info.total_size_formatted.clone(),
-                    js_info.external_js_count.to_string(),
-                ]);
+                let entry = js_agg
+                    .entry(url.clone())
+                    .or_insert_with(|| AssetAgg::new(js_info.total_size_formatted.clone()));
+                entry.add_page(&page.url);
+                entry.extra = js_info.external_js_count;
             }
         }
     }
 
-    vec![overview, internal, external, redirects, images, css, js, files]
+    let mut images = Sheet::new(
+        "Images",
+        &[
+            "Image URL",
+            "File Type",
+            "Pages Using",
+            "Missing Alt",
+            "Size",
+            "Sample Pages",
+        ],
+    );
+    for (url, agg) in sorted_asset_rows(images_agg) {
+        images.push(vec![
+            url.clone(),
+            url_extension(&url),
+            agg.pages_using.to_string(),
+            agg.extra.to_string(),
+            agg.info,
+            agg.sample_pages.join("; "),
+        ]);
+    }
+
+    let mut css = Sheet::new("CSS", &["CSS URL", "File Type", "Pages Using", "Sample Pages"]);
+    for (url, agg) in sorted_asset_rows(css_agg) {
+        css.push(vec![
+            url.clone(),
+            url_extension(&url),
+            agg.pages_using.to_string(),
+            agg.sample_pages.join("; "),
+        ]);
+    }
+
+    let mut js = Sheet::new(
+        "JavaScript",
+        &["JavaScript URL", "File Type", "Pages Using", "Sample Pages"],
+    );
+    for (url, agg) in sorted_asset_rows(js_agg) {
+        js.push(vec![
+            url.clone(),
+            url_extension(&url),
+            agg.pages_using.to_string(),
+            agg.sample_pages.join("; "),
+        ]);
+    }
+
+    let mut files = Sheet::new(
+        "Files",
+        &["File URL", "File Type", "Pages Using", "Sample Pages"],
+    );
+    for (url, agg) in sorted_asset_rows(files_agg) {
+        files.push(vec![
+            url.clone(),
+            url_extension(&url),
+            agg.pages_using.to_string(),
+            agg.sample_pages.join("; "),
+        ]);
+    }
+
+    let mut sheets = vec![
+        overview,
+        cwv_sheet(pages),
+        content_sheet(pages),
+        internal,
+        external,
+        redirects,
+        images,
+        css,
+        js,
+        files,
+    ];
+    sheets.shrink_to_fit();
+    sheets
 }
 
-/// The issue audit as a sheet: issue, count, sample URLs.
-pub fn issues_sheet(pages: &[PageData], base_domain: Option<&str>) -> Sheet {
-    let summaries: Vec<_> = pages
-        .iter()
-        .map(|p| p.summarize(base_domain))
-        .collect();
+/// Core Web Vitals / PageSpeed Insights, one row per page that has data.
+pub fn cwv_sheet(pages: &[PageData]) -> Sheet {
+    let mut sheet = Sheet::new(
+        "CWV",
+        &[
+            "URL",
+            "Desk Score",
+            "Mob Score",
+            "Desk LCP",
+            "Desk CLS",
+            "Desk TBT",
+            "Desk FCP",
+            "Desk SI",
+            "Mob LCP",
+            "Mob CLS",
+            "Mob TBT",
+            "Mob FCP",
+            "Mob SI",
+        ],
+    );
+    for page in pages {
+        let desktop = page.cwv_desktop.as_ref();
+        let mobile = page.cwv_mobile.as_ref();
+        if desktop.is_none() && mobile.is_none() {
+            continue;
+        }
+        let value = |data: Option<&crate::crawler::helpers::html_parser::CwvData>,
+                     pick: fn(
+            &crate::crawler::helpers::html_parser::CwvData,
+        ) -> &str|
+         -> String {
+            data.map(|d| pick(d).to_string()).unwrap_or_default()
+        };
+        sheet.push(vec![
+            page.url.clone(),
+            value(desktop, |d| &d.performance_score),
+            value(mobile, |d| &d.performance_score),
+            value(desktop, |d| &d.lcp),
+            value(desktop, |d| &d.cls),
+            value(desktop, |d| &d.tbt),
+            value(desktop, |d| &d.fcp),
+            value(desktop, |d| &d.speed_index),
+            value(mobile, |d| &d.lcp),
+            value(mobile, |d| &d.cls),
+            value(mobile, |d| &d.tbt),
+            value(mobile, |d| &d.fcp),
+            value(mobile, |d| &d.speed_index),
+        ]);
+    }
+    sheet
+}
 
-    let mut sheet = Sheet::new("Issues", &["Issue", "Count", "Sample URLs"]);
+/// Content-focused per-page metrics.
+pub fn content_sheet(pages: &[PageData]) -> Sheet {
+    let mut sheet = Sheet::new(
+        "Content",
+        &[
+            "URL",
+            "Title",
+            "Title Len",
+            "Description",
+            "Desc Len",
+            "H1",
+            "H1s",
+            "H2s",
+            "H3s",
+            "Words",
+            "Size (bytes)",
+            "Keywords",
+        ],
+    );
+    for page in pages {
+        let summary = page.summarize(None);
+        let keywords: Vec<String> = page.keywords.iter().take(5).cloned().collect();
+        sheet.push(vec![
+            page.url.clone(),
+            page.title.clone(),
+            page.title_len.to_string(),
+            page.description.clone(),
+            page.description_len.to_string(),
+            page.h1.clone(),
+            summary.h1_count.to_string(),
+            summary.h2_count.to_string(),
+            summary.h3_count.to_string(),
+            summary.word_count.to_string(),
+            page.size.to_string(),
+            keywords.join(", "),
+        ]);
+    }
+    sheet
+}
+
+/// The issue audit as a sheet: severity, issue, count, sample URLs.
+pub fn issues_sheet(pages: &[PageData], base_domain: Option<&str>) -> Sheet {
+    let summaries: Vec<_> = pages.iter().map(|p| p.summarize(base_domain)).collect();
+
+    let mut sheet = Sheet::new("Issues", &["Severity", "Issue", "Count", "Sample URLs"]);
     for handler in IssueAnalyzer::get_handlers() {
         let (count, urls) = (handler.process)(&summaries);
         if count > 0 {
             let sample: Vec<String> = urls.iter().take(10).cloned().collect();
             sheet.push(vec![
+                severity_for(handler.name).as_str().to_string(),
                 handler.name.trim().to_string(),
                 count.to_string(),
                 sample.join(" | "),
@@ -202,18 +407,28 @@ const FILE_EXTENSIONS: &[&str] = &[
     "gz", "tar", "mp4", "mp3", "wav", "avi", "mov",
 ];
 
-fn file_extension(url: &str) -> Option<&str> {
+fn url_extension(url: &str) -> String {
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
-    let last_segment = without_query.rsplit('/').next()?;
-    let ext = last_segment.rsplit('.').next()?;
-    if ext == last_segment {
-        return None;
+    let last_segment = without_query.rsplit('/').next().unwrap_or("");
+    match last_segment.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            ext.to_ascii_lowercase()
+        }
+        _ => String::new(),
     }
-    let ext_lower = ext.to_ascii_lowercase();
+}
+
+fn file_extension(url: &str) -> Option<&str> {
+    let ext = url_extension(url);
     FILE_EXTENSIONS
         .iter()
-        .find(|known| **known == ext_lower)
+        .find(|known| **known == ext)
         .copied()
+}
+
+/// True when a URL points at a downloadable file (by extension).
+pub fn is_file_url(url: &str) -> bool {
+    file_extension(url).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -296,10 +511,7 @@ pub fn write_csv_zip(sheets: &[Sheet], path: &Path) -> Result<()> {
     let options = zip::write::SimpleFileOptions::default();
 
     for sheet in sheets {
-        let name = format!(
-            "{}.csv",
-            sheet.name.to_lowercase().replace(' ', "_")
-        );
+        let name = format!("{}.csv", sheet.name.to_lowercase().replace(' ', "_"));
         zip.start_file(name, options)?;
         zip.write_all(sheet_to_csv(sheet).as_bytes())?;
     }
@@ -308,10 +520,7 @@ pub fn write_csv_zip(sheets: &[Sheet], path: &Path) -> Result<()> {
 }
 
 /// JSON report: session metadata plus every sheet.
-pub fn report_json(
-    session: &crate::db::SessionRow,
-    sheets: &[Sheet],
-) -> Result<serde_json::Value> {
+pub fn report_json(session: &crate::db::SessionRow, sheets: &[Sheet]) -> Result<serde_json::Value> {
     let sheet_values: Vec<serde_json::Value> = sheets
         .iter()
         .map(|sheet| {

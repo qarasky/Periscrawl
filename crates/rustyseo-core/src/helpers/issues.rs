@@ -6,6 +6,55 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::crawler::helpers::robots;
 use crate::models::{InternalLink, PageSummary, RedirectEntry};
 
+/// How urgently an issue should be fixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueSeverity {
+    Critical,
+    Warning,
+    Notice,
+}
+
+impl IssueSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IssueSeverity::Critical => "critical",
+            IssueSeverity::Warning => "warning",
+            IssueSeverity::Notice => "notice",
+        }
+    }
+}
+
+/// Severity classification for a (trimmed) issue name.
+pub fn severity_for(issue_name: &str) -> IssueSeverity {
+    match issue_name.trim() {
+        "404 Errors" | "5XX Errors" | "Non HTTPS"
+        | "Mixed Content (HTTP Resources on HTTPS Page)" => IssueSeverity::Critical,
+
+        "3XX Errors"
+        | "Missing H1"
+        | "Missing Page Title"
+        | "Missing Page Description"
+        | "Duplicate Title Tags"
+        | "Duplicate Meta Descriptions"
+        | "Duplicate H1 Tags"
+        | "Duplicate Content"
+        | "Multiple Canonical Tags"
+        | "Canonicalised to Another URL"
+        | "Noindex (Meta Robots)"
+        | "Noindex (X-Robots-Tag Header)"
+        | "Slow Load (Poor CWV Performance)"
+        | "Missing Viewport (Not Mobile Friendly)"
+        | "Missing HTML Lang Attribute"
+        | "Missing Alt Text"
+        | "Thin Content (< 300 words)"
+        | "Large HTML Pages"
+        | "Low Internal Link Count" => IssueSeverity::Warning,
+
+        _ => IssueSeverity::Notice,
+    }
+}
+
 // Simple cache for robots.txt results to avoid repeated network requests
 #[derive(Clone, Debug)]
 struct CachedRobotsResult {

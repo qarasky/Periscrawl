@@ -7,6 +7,7 @@
 pub mod ai;
 pub mod crawler;
 pub mod db;
+pub mod diff;
 pub mod export;
 pub mod helpers;
 pub mod logging;
