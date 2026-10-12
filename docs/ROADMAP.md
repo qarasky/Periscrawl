@@ -71,10 +71,13 @@ Rules:
 
 ### Phase 4 — Sync + agent-native
 
-- [ ] Local socket protocol (NDJSON over Unix socket / Windows named pipe)
-- [ ] Live GUI ↔ CLI attach: start in one, watch/control from the other
+- [x] Loopback socket protocol (NDJSON over 127.0.0.1 TCP with `sync.token` auth)
+- [x] Shared `CrawlService`: GUI hosts the sync server; `rustyseo serve` for headless;
+      `rustyseo status` / `watch` / `stop` attach from any terminal
+- [x] Crawl delegation: `rustyseo crawl` runs through the active server by default
+      (`--local` opts out) so every frontend sees the same crawl live
+- [x] Stop support end-to-end (engine stop flag, GUI Stop button, sessions marked `stopped`)
 - [ ] MCP server mode (`rustyseo mcp`) exposing crawl/query tools
-- [ ] Optional `rustyseo serve` daemon
 
 ### Phase 5 — Feature ports (from the pre-closed-source design)
 

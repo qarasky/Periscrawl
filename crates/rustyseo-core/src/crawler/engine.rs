@@ -52,6 +52,8 @@ pub struct CrawlEngine {
     /// Baseline pages from a previous session for conditional requests
     /// (incremental re-crawls). Keyed by normalized URL.
     incremental: Option<Arc<HashMap<String, PageData>>>,
+    /// Cooperative stop flag: when set, the crawl drains and ends early.
+    stop_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Shared adaptive pacing for outgoing requests (429/5xx aware).
     rate_limiter: Arc<AdaptiveRateLimiter>,
 }
@@ -117,6 +119,7 @@ impl CrawlEngine {
             resume_pages: None,
             id_base: 0,
             incremental: None,
+            stop_flag: None,
             rate_limiter: Arc::new(AdaptiveRateLimiter::default_polite()),
         }
     }
@@ -236,8 +239,7 @@ impl CrawlEngine {
     /// Re-crawl incrementally: pages from a previous session provide
     /// ETag / Last-Modified validators, and 304 responses reuse that stored
     /// content instead of re-downloading it.
-    pub fn with_incremental_baseline(mut self, pages: Vec<PageData>) -> Self {
-        let mut baseline: HashMap<String, PageData> = HashMap::with_capacity(pages.len());
+    pub fn with_incremental_baseline(mut self, pages: Vec<PageData>) -> Self {        let mut baseline: HashMap<String, PageData> = HashMap::with_capacity(pages.len());
         for page in pages {
             if !page.requested_url.is_empty() {
                 let requested =
@@ -250,6 +252,14 @@ impl CrawlEngine {
             baseline.insert(key, page);
         }
         self.incremental = Some(Arc::new(baseline));
+        self
+    }
+
+    /// Cooperative cancellation: set the flag to make the crawl stop after the
+    /// in-flight requests drain. Callers are responsible for marking the
+    /// session status (`stopped`) afterwards.
+    pub fn with_stop_flag(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.stop_flag = Some(flag);
         self
     }
 
@@ -465,7 +475,12 @@ impl CrawlEngine {
         while !queue.is_empty() || !join_set.is_empty() {
             // Fill up our concurrency quota
             while !queue.is_empty() && join_set.len() < self.concurrency_limit {
-                if spawned >= self.max_pages {
+                if spawned >= self.max_pages
+                    || self
+                        .stop_flag
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
                     break;
                 }
 
@@ -732,9 +747,13 @@ impl CrawlEngine {
                 }
             }
 
-            // Reached the page budget: stop spawning new fetches; just drain
-            // the tasks that are already in flight.
-            if spawned >= self.max_pages {
+            // Reached the page budget (or asked to stop): stop spawning new
+            // fetches; just drain the tasks that are already in flight.
+            let stop_requested = self
+                .stop_flag
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed));
+            if spawned >= self.max_pages || stop_requested {
                 queue.clear();
             }
 

@@ -9,7 +9,7 @@ use egui_extras::{Column, TableBuilder};
 use rustyseo_core::diff::DiffKind;
 use rustyseo_core::export::{self, Sheet};
 
-use crate::app::{AssetKind, CentralTab, DetailView, ExportKind, LiveCrawl, RustySeoApp};
+use crate::app::{AssetKind, CentralTab, DetailView, ExportKind, RustySeoApp};
 
 const ACCENT: Color32 = Color32::from_rgb(90, 150, 255);
 const OK_GREEN: Color32 = Color32::from_rgb(120, 215, 140);
@@ -198,19 +198,15 @@ fn bottom_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
             match &app.crawl {
                 Some(crawl) => {
                     ui.spinner();
-                    let robots = crawl
-                        .stats
-                        .as_ref()
-                        .map(|s| s.robots_blocked())
-                        .unwrap_or(0);
                     ui.label(format!(
-                        "Crawling • {} pages • {} failed • queued {} • processing {} • {} robots-blocked • {:.0}s",
+                        "Crawling • {} pages • {} failed • queued {} • processing {} • {} robots-blocked • {:.0}s{}",
                         crawl.pages,
                         crawl.failed,
                         crawl.queued,
                         crawl.processing,
-                        robots,
-                        crawl.started.elapsed().as_secs_f32()
+                        crawl.robots_blocked,
+                        crawl.started.elapsed().as_secs_f32(),
+                        if crawl.stop_requested { " • stopping" } else { "" }
                     ));
                 }
                 None => {
@@ -218,6 +214,25 @@ fn bottom_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let sync_port = app.sync_port.lock().ok().and_then(|port| *port);
+                match sync_port {
+                    Some(port) => {
+                        ui.label(
+                            RichText::new(format!("sync ● 127.0.0.1:{port}"))
+                                .color(OK_GREEN)
+                                .small(),
+                        )
+                        .on_hover_text(
+                            "rustyseo status / watch / stop and other instances attach here",
+                        );
+                    }
+                    None => {
+                        ui.label(RichText::new("sync off").weak().small())
+                            .on_hover_text(
+                                "No sync server is listening (another instance may already hold it)",
+                            );
+                    }
+                }
                 ui.label(
                     RichText::new(format!("{} sessions", app.sessions.len()))
                         .weak()
@@ -232,8 +247,7 @@ fn bottom_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
 fn central(app: &mut RustySeoApp, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
         if app.crawl.is_some() {
-            let crawl = app.crawl.as_ref().expect("checked above");
-            live_view(ui, crawl);
+            live_view(app, ui);
             return;
         }
         if app.loading_session {
@@ -531,6 +545,8 @@ fn click_target_for(sheet_name: &str, row: &[String]) -> Option<ClickTarget> {
     match sheet_name {
         // severity | issue | count | sample urls
         "Issues" => row.get(1).map(|issue| ClickTarget::Issue(issue.clone())),
+        // ID | URL | ...
+        "Overview" => row.get(1).map(|url| ClickTarget::Page(url.clone())),
         // page | target | ...
         _ => row.first().map(|url| ClickTarget::Page(url.clone())),
     }
@@ -1001,54 +1017,80 @@ fn diff_entry_detail(app: &RustySeoApp, ui: &mut egui::Ui, index: usize) -> Opti
 // Live crawl
 // ---------------------------------------------------------------------------
 
-fn live_view(ui: &mut egui::Ui, crawl: &LiveCrawl) {
-    ui.horizontal(|ui| {
-        ui.spinner();
-        ui.heading("Crawling");
-        ui.label(RichText::new(&crawl.url).weak());
-    });
-    ui.add_space(4.0);
-
-    let fraction = (crawl.pages as f32 / crawl.max_pages.max(1) as f32).clamp(0.0, 1.0);
-    ui.add(
-        egui::ProgressBar::new(fraction)
-            .show_percentage()
-            .desired_height(14.0),
-    );
-    ui.add_space(4.0);
-
-    let robots = crawl
-        .stats
-        .as_ref()
-        .map(|s| s.robots_blocked())
-        .unwrap_or(0);
-    ui.label(format!(
-        "{} pages • {} failed • queued {} • processing {} • robots-blocked {} • {:.0}s elapsed",
-        crawl.pages,
-        crawl.failed,
-        crawl.queued,
-        crawl.processing,
-        robots,
-        crawl.started.elapsed().as_secs_f32()
-    ));
-    ui.separator();
-    ui.label(RichText::new("Latest pages").strong());
-
-    egui::ScrollArea::vertical()
-        .stick_to_bottom(true)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for page in &crawl.recent {
-                let color = if page.failed { ERR_RED } else { OK_GREEN };
-                ui.monospace(
-                    RichText::new(format!(
-                        "[{}] {} ({} links)",
-                        page.status, page.url, page.links
-                    ))
-                    .color(color),
-                );
-            }
+fn live_view(app: &mut RustySeoApp, ui: &mut egui::Ui) {
+    let mut stop_clicked = false;
+    {
+        let Some(crawl) = app.crawl.as_ref() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.heading("Crawling");
+            ui.label(RichText::new(&crawl.url).weak());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !crawl.stop_requested
+                    && ui
+                        .button(RichText::new("■ Stop").color(ERR_RED))
+                        .clicked()
+                {
+                    stop_clicked = true;
+                }
+            });
         });
+        ui.add_space(4.0);
+
+        // Processed / discovered pages — a rough sense of remaining work.
+        let total = crawl.pages + crawl.queued + crawl.processing;
+        let fraction = if total == 0 {
+            0.0
+        } else {
+            crawl.pages as f32 / total as f32
+        };
+        ui.add(
+            egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                .show_percentage()
+                .desired_height(14.0),
+        );
+        ui.add_space(4.0);
+        ui.label(format!(
+            "{} pages • {} failed • queued {} • processing {} • {} robots-blocked • {} rendered • {} not modified • {:.0}s elapsed{}",
+            crawl.pages,
+            crawl.failed,
+            crawl.queued,
+            crawl.processing,
+            crawl.robots_blocked,
+            crawl.js_renders,
+            crawl.not_modified,
+            crawl.started.elapsed().as_secs_f32(),
+            if crawl.stop_requested { " • stopping…" } else { "" }
+        ));
+        ui.separator();
+        ui.label(RichText::new("Latest pages").strong());
+
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for page in &crawl.recent {
+                    let color = if page.failed { ERR_RED } else { OK_GREEN };
+                    let suffix = match (page.js_rendered, page.not_modified) {
+                        (true, _) => " [js]",
+                        (_, true) => " [304]",
+                        _ => "",
+                    };
+                    ui.monospace(
+                        RichText::new(format!(
+                            "[{}] {} ({} links){}",
+                            page.status, page.url, page.links, suffix
+                        ))
+                        .color(color),
+                    );
+                }
+            });
+    }
+    if stop_clicked {
+        app.stop_crawl();
+    }
 }
 
 // ---------------------------------------------------------------------------

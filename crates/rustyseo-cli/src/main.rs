@@ -6,15 +6,20 @@
 //!   2  crawl produced no pages
 //!   3  config key not found
 //!   6  regressions detected (with `crawl --compare` or `diff --fail-on-regressions`)
+//!   7  `watch` timed out
 //!
 //! With `--json-events`, crawl emits newline-delimited JSON on stdout:
 //!   {"event":"page", ...} and a final {"event":"crawl.end", ...} record.
 //! Every crawl is recorded as a session; query results later with
 //! `rustyseo sessions` and `rustyseo session <id> ...`. List-style commands
 //! support `--fields` to project the JSON objects down to the keys you need.
+//!
+//! Live sync: when a sync server is running (`rustyseo serve`, or the GUI),
+//! `crawl` delegates to it by default so every frontend can watch the same
+//! crawl — `rustyseo watch` streams its events, `rustyseo stop` stops it.
 
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -24,6 +29,7 @@ use rustyseo_core::db;
 use rustyseo_core::diff::{self, DiffEntry, DiffKind};
 use rustyseo_core::helpers::issues::{IssueAnalyzer, severity_for};
 use rustyseo_core::models::{AppSettings, PageSummary};
+use rustyseo_core::server::SyncClient;
 
 #[derive(Parser)]
 #[command(name = "rustyseo", version, about = "Crawl and audit websites from the terminal.", long_about = None)]
@@ -79,6 +85,12 @@ enum Command {
         /// Only print the final summary (no per-page lines).
         #[arg(long)]
         quiet: bool,
+
+        /// Run the crawl in this process even when a sync server is running.
+        /// By default crawls delegate to the running server so the GUI and
+        /// other terminals can watch them live.
+        #[arg(long)]
+        local: bool,
 
         /// Emit newline-delimited JSON events instead of human-readable lines.
         #[arg(long)]
@@ -166,6 +178,30 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show the state of the running sync server (and its active crawl).
+    Status {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stream live crawl events from the sync server (GUI or `rustyseo serve`).
+    Watch {
+        /// Print raw NDJSON events (same shape as `crawl --json-events`).
+        #[arg(long)]
+        json: bool,
+
+        /// Give up after this many seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
+
+    /// Ask the crawl running on the sync server to stop.
+    Stop,
+
+    /// Run a headless sync server that other commands and the GUI attach to.
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -259,6 +295,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             compare,
             no_db,
             quiet,
+            local,
             json_events,
             name,
         } => {
@@ -273,6 +310,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 compare,
                 no_db,
                 quiet,
+                local,
                 json_events,
                 name,
             })
@@ -299,6 +337,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         } => export(session, format, out, tab),
         Command::Config { action } => config(action),
         Command::Doctor { json } => doctor(json),
+        Command::Status { json } => status_command(json).await,
+        Command::Watch { json, timeout } => watch_command(json, timeout).await,
+        Command::Stop => stop_command().await,
+        Command::Serve => serve_command().await,
     }
 }
 
@@ -313,11 +355,23 @@ struct CrawlArgs {
     compare: Option<i64>,
     no_db: bool,
     quiet: bool,
+    local: bool,
     json_events: bool,
     name: Option<String>,
 }
 
 async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
+    // Live sync: when a sync server is running (GUI or `rustyseo serve`) and
+    // this crawl can be expressed as a service request, delegate to it so
+    // every frontend sees the same crawl in real time.
+    if !args.local
+        && args.resume.is_none()
+        && args.since.is_none()
+        && rustyseo_core::server::server_ping().await.is_some()
+    {
+        return crawl_via_server(args).await;
+    }
+
     let CrawlArgs {
         url,
         max_pages,
@@ -329,6 +383,7 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
         compare,
         no_db,
         quiet,
+        local: _,
         json_events,
         name,
     } = args;
@@ -528,51 +583,8 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
 
     // Regression check against a baseline session, for scheduled audits.
     let mut regressions = 0usize;
-    if let Some(baseline_id) = compare {
-        if let Some(current_id) = session_id {
-            let Some(baseline_session) = db::get_session(baseline_id)? else {
-                eprintln!("baseline session {baseline_id} not found");
-                return Ok(ExitCode::FAILURE);
-            };
-            let Some(current_session) = db::get_session(current_id)? else {
-                eprintln!("session {current_id} not found");
-                return Ok(ExitCode::FAILURE);
-            };
-            let baseline_summaries =
-                session_summaries(baseline_id, &baseline_session.start_url)?;
-            let current_summaries = session_summaries(current_id, &current_session.start_url)?;
-            let (entries, diff_stats) = diff::diff_sessions(&baseline_summaries, &current_summaries);
-            let regression_entries: Vec<&DiffEntry> =
-                entries.iter().filter(|entry| is_regression(entry)).collect();
-            regressions = regression_entries.len();
-
-            if json_events {
-                println!(
-                    "{}",
-                    json!({
-                        "event": "diff",
-                        "baseline": baseline_id,
-                        "added": diff_stats.added,
-                        "removed": diff_stats.removed,
-                        "changed": diff_stats.changed,
-                        "unchanged": diff_stats.unchanged,
-                        "regressions": regressions,
-                    })
-                );
-            } else {
-                println!(
-                    "Diff vs session {baseline_id}: +{} added, −{} removed, ~{} changed, {} unchanged — {} regression(s)",
-                    diff_stats.added,
-                    diff_stats.removed,
-                    diff_stats.changed,
-                    diff_stats.unchanged,
-                    regressions
-                );
-                for entry in regression_entries.iter().take(20) {
-                    println!("  [{}] {}", diff_kind_label(entry.kind), entry.url);
-                }
-            }
-        }
+    if let (Some(baseline_id), Some(current_id)) = (compare, session_id) {
+        regressions = compare_against(baseline_id, current_id, json_events)?;
     }
 
     if pages == 0 {
@@ -581,6 +593,338 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
     if regressions > 0 {
         return Ok(ExitCode::from(6));
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Diff `current` against `baseline`, print the result and return the number
+/// of regressions (removed pages, new 4xx/5xx, newly noindexed).
+fn compare_against(
+    baseline_id: i64,
+    current_id: i64,
+    json_events: bool,
+) -> anyhow::Result<usize> {
+    let baseline_session = db::get_session(baseline_id)?
+        .ok_or_else(|| anyhow::anyhow!("baseline session {baseline_id} not found"))?;
+    let current_session = db::get_session(current_id)?
+        .ok_or_else(|| anyhow::anyhow!("session {current_id} not found"))?;
+
+    let baseline_summaries = session_summaries(baseline_id, &baseline_session.start_url)?;
+    let current_summaries = session_summaries(current_id, &current_session.start_url)?;
+    let (entries, diff_stats) = diff::diff_sessions(&baseline_summaries, &current_summaries);
+    let regression_entries: Vec<&DiffEntry> =
+        entries.iter().filter(|entry| is_regression(entry)).collect();
+    let regressions = regression_entries.len();
+
+    if json_events {
+        println!(
+            "{}",
+            json!({
+                "event": "diff",
+                "baseline": baseline_id,
+                "added": diff_stats.added,
+                "removed": diff_stats.removed,
+                "changed": diff_stats.changed,
+                "unchanged": diff_stats.unchanged,
+                "regressions": regressions,
+            })
+        );
+    } else {
+        println!(
+            "Diff vs session {baseline_id}: +{} added, −{} removed, ~{} changed, {} unchanged — {} regression(s)",
+            diff_stats.added,
+            diff_stats.removed,
+            diff_stats.changed,
+            diff_stats.unchanged,
+            regressions
+        );
+        for entry in regression_entries.iter().take(20) {
+            println!("  [{}] {}", diff_kind_label(entry.kind), entry.url);
+        }
+    }
+
+    Ok(regressions)
+}
+
+/// Delegate a crawl to the running sync server and stream its events, so the
+/// output matches a local crawl while the GUI (or another terminal) sees the
+/// same crawl live.
+async fn crawl_via_server(args: CrawlArgs) -> anyhow::Result<ExitCode> {
+    let CrawlArgs {
+        url,
+        max_pages,
+        js,
+        compare,
+        quiet,
+        json_events,
+        name,
+        ..
+    } = args;
+
+    let mut client = SyncClient::connect().await.map_err(anyhow::Error::msg)?;
+    if !quiet && !json_events {
+        println!("Delegating to the running sync server (use --local to crawl in this process).");
+    }
+
+    let result = client
+        .request(
+            "crawl.start",
+            json!({ "url": url, "name": name, "max_pages": max_pages, "js": js }),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let session_id = result.get("session_id").and_then(serde_json::Value::as_i64);
+
+    client
+        .request("subscribe", json!({}))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let mut pages = 0usize;
+    let mut failed = 0usize;
+    while let Some(event) = client.next_event().await.map_err(anyhow::Error::msg)? {
+        let event_name = event
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        match event_name.as_str() {
+            "page" => {
+                pages += 1;
+                let status = event["status"].as_str().unwrap_or("");
+                let code = status.get(..3).and_then(|c| c.parse::<u16>().ok());
+                if code.is_none_or(|c| c >= 400) {
+                    failed += 1;
+                }
+                if json_events {
+                    println!("{event}");
+                } else if !quiet {
+                    let suffix = match (
+                        event["js_rendered"].as_bool(),
+                        event["not_modified"].as_bool(),
+                    ) {
+                        (Some(true), _) => " [js]",
+                        (_, Some(true)) => " [304]",
+                        _ => "",
+                    };
+                    println!(
+                        "[{}] {} - {} links found{}",
+                        status,
+                        event["url"].as_str().unwrap_or(""),
+                        event["links"],
+                        suffix
+                    );
+                }
+            }
+            "progress" => {
+                if json_events {
+                    println!("{event}");
+                }
+            }
+            "crawl.end" => {
+                pages = event["pages"].as_u64().unwrap_or(pages as u64) as usize;
+                failed = event["failed"].as_u64().unwrap_or(failed as u64) as usize;
+                if json_events {
+                    println!("{event}");
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if !json_events {
+        let session_note = session_id
+            .map(|sid| format!(" (session {sid})"))
+            .unwrap_or_default();
+        println!("\nCrawled {pages} pages ({failed} non-2xx/3xx){session_note}");
+    }
+
+    let mut regressions = 0usize;
+    if let (Some(baseline_id), Some(current_id)) = (compare, session_id) {
+        regressions = compare_against(baseline_id, current_id, json_events)?;
+    }
+
+    if pages == 0 {
+        return Ok(ExitCode::from(2));
+    }
+    if regressions > 0 {
+        return Ok(ExitCode::from(6));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Live sync commands
+// ---------------------------------------------------------------------------
+
+async fn status_command(json_output: bool) -> anyhow::Result<ExitCode> {
+    match SyncClient::connect().await {
+        Ok(mut client) => {
+            let status = client
+                .request("status", json!({}))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "server": true, "status": status }))?
+                );
+            } else if status["running"].as_bool() == Some(true) {
+                println!(
+                    "Crawling {} — {} pages, {} failed, queued {}, processing {} • {:.0}s{}",
+                    status["url"].as_str().unwrap_or(""),
+                    status["pages"].as_u64().unwrap_or(0),
+                    status["failed"].as_u64().unwrap_or(0),
+                    status["queued"].as_u64().unwrap_or(0),
+                    status["processing"].as_u64().unwrap_or(0),
+                    status["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0,
+                    if status["stop_requested"].as_bool() == Some(true) {
+                        " (stopping…)"
+                    } else {
+                        ""
+                    }
+                );
+                if let Some(sid) = status["session_id"].as_i64() {
+                    println!("  session: {sid}");
+                }
+            } else {
+                println!("Sync server is running; no crawl is active.");
+            }
+        }
+        Err(_) => {
+            if json_output {
+                println!("{}", json!({ "server": false }));
+            } else {
+                println!(
+                    "No RustySEO sync server is running.\nStart one with `rustyseo serve`, or open the GUI."
+                );
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn watch_command(json_output: bool, timeout_secs: Option<u64>) -> anyhow::Result<ExitCode> {
+    let mut client = match SyncClient::connect().await {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!(
+                "error: {err}\nStart a sync server (`rustyseo serve`) or open the GUI first."
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    client
+        .request("subscribe", json!({}))
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    let deadline = timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs));
+    loop {
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                eprintln!("watch timed out");
+                return Ok(ExitCode::from(7));
+            }
+        }
+        let event = match tokio::time::timeout(Duration::from_secs(1), client.next_event()).await {
+            Ok(Ok(Some(event))) => event,
+            Ok(Ok(None)) => break,
+            Ok(Err(err)) => {
+                eprintln!("error: {err}");
+                return Ok(ExitCode::FAILURE);
+            }
+            Err(_) => continue, // tick: re-check the deadline
+        };
+
+        let event_name = event
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if json_output {
+            println!("{event}");
+        } else {
+            match event_name {
+                "page" => {
+                    let suffix = match (
+                        event["js_rendered"].as_bool(),
+                        event["not_modified"].as_bool(),
+                    ) {
+                        (Some(true), _) => " [js]",
+                        (_, Some(true)) => " [304]",
+                        _ => "",
+                    };
+                    println!(
+                        "[{}] {} - {} links found{}",
+                        event["status"].as_str().unwrap_or(""),
+                        event["url"].as_str().unwrap_or(""),
+                        event["links"],
+                        suffix
+                    );
+                }
+                "crawl.end" => {
+                    println!(
+                        "\nCrawl finished: {} pages, {} failed (session {}, {}s)",
+                        event["pages"].as_u64().unwrap_or(0),
+                        event["failed"].as_u64().unwrap_or(0),
+                        event["session_id"].as_i64().unwrap_or(-1),
+                        event["elapsed_ms"].as_u64().unwrap_or(0) / 1000
+                    );
+                }
+                _ => {}
+            }
+        }
+        if event_name == "crawl.end" {
+            break;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn stop_command() -> anyhow::Result<ExitCode> {
+    let mut client = match SyncClient::connect().await {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return Ok(ExitCode::FAILURE);
+        }
+    };
+    let result = client
+        .request("crawl.stop", json!({}))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    if result["stopped"].as_bool() == Some(true) {
+        println!("Stop requested; the crawl will end after in-flight requests finish.");
+    } else {
+        println!("No crawl is running.");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn serve_command() -> anyhow::Result<ExitCode> {
+    db::init_db();
+    rustyseo_core::settings::utils::create::create_settings_file().await;
+
+    let service = rustyseo_core::server::CrawlService::new();
+    match rustyseo_core::server::start_sync_server(service).await {
+        Ok(info) => {
+            println!(
+                "RustySEO sync server listening on 127.0.0.1:{} (token: {})",
+                info.port,
+                rustyseo_core::server::token_file().display()
+            );
+            println!(
+                "`rustyseo crawl <url>` delegates here, `rustyseo watch` streams events, `rustyseo stop` stops."
+            );
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+
+    tokio::signal::ctrl_c().await.ok();
+    println!("\nSync server shutting down.");
     Ok(ExitCode::SUCCESS)
 }
 

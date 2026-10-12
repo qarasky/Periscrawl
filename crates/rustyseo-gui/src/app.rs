@@ -1,16 +1,23 @@
 //! Application state and background jobs (crawls, session loads, diffs, exports).
+//!
+//! Crawls are owned by a shared [`CrawlService`]: the GUI hosts the sync
+//! server and drives crawls through it, so `rustyseo serve`/`status`/`watch`/
+//! `stop` and other GUI instances all see the same live crawl.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rustyseo_core::crawler::stats::CrawlStats;
-use rustyseo_core::crawler::{CrawlEngine, CrawlMessage};
+use serde_json::Value;
+use tokio::sync::broadcast;
+
 use rustyseo_core::db::{self, SessionRow};
 use rustyseo_core::diff::{self, DiffEntry, DiffStats};
 use rustyseo_core::export::{self, Sheet};
 use rustyseo_core::helpers::issues::IssueAnalyzer;
 use rustyseo_core::models::{AppSettings, PageSummary};
+use rustyseo_core::server::{CrawlOptions, CrawlService};
 use rustyseo_core::PageData;
 
 pub struct CrawlForm {
@@ -26,41 +33,42 @@ pub struct LivePage {
     pub url: String,
     pub links: usize,
     pub failed: bool,
-}
-
-pub enum CrawlEvent {
-    Ready { stats: CrawlStats },
-    Page {
-        status: String,
-        url: String,
-        links: usize,
-        failed: bool,
-    },
-    Progress {
-        scanned: usize,
-        queued: usize,
-        processing: usize,
-    },
-    Finished {
-        pages: usize,
-        failed: usize,
-    },
+    pub not_modified: bool,
+    pub js_rendered: bool,
 }
 
 pub struct LiveCrawl {
     pub url: String,
-    pub max_pages: usize,
     pub session_id: Option<i64>,
-    pub rx: Receiver<CrawlEvent>,
-    pub stats: Option<CrawlStats>,
     pub started: Instant,
     pub pages: usize,
     pub failed: usize,
-    pub scanned: usize,
     pub queued: usize,
     pub processing: usize,
+    pub robots_blocked: usize,
+    pub js_renders: usize,
+    pub not_modified: usize,
+    pub stop_requested: bool,
     pub recent: Vec<LivePage>,
-    pub done: bool,
+}
+
+impl LiveCrawl {
+    fn new(url: String, session_id: Option<i64>) -> Self {
+        Self {
+            url,
+            session_id,
+            started: Instant::now(),
+            pages: 0,
+            failed: 0,
+            queued: 0,
+            processing: 0,
+            robots_blocked: 0,
+            js_renders: 0,
+            not_modified: 0,
+            stop_requested: false,
+            recent: Vec::new(),
+        }
+    }
 }
 
 pub struct LoadedSession {
@@ -138,6 +146,9 @@ impl AssetKind {
 
 pub struct RustySeoApp {
     pub runtime: tokio::runtime::Runtime,
+    pub service: CrawlService,
+    events: broadcast::Receiver<Value>,
+    pub sync_port: Arc<Mutex<Option<u16>>>,
     pub sessions: Vec<SessionRow>,
     pub selected_session: Option<i64>,
     pub pages: Vec<PageData>,
@@ -179,8 +190,36 @@ impl RustySeoApp {
         let (status_tx, status_rx) = channel();
         let log_path = db::get_db_path().with_file_name("gui.log");
 
+        let service = CrawlService::new();
+        let events = service.subscribe();
+        let sync_port: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(None));
+        {
+            let service = service.clone();
+            let status_tx = status_tx.clone();
+            let sync_port = Arc::clone(&sync_port);
+            runtime.spawn(async move {
+                match rustyseo_core::server::start_sync_server(service).await {
+                    Ok(info) => {
+                        if let Ok(mut port) = sync_port.lock() {
+                            *port = Some(info.port);
+                        }
+                        let _ = status_tx.send(format!(
+                            "Sync server listening on 127.0.0.1:{} — `rustyseo watch` attaches here",
+                            info.port
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = status_tx.send(format!("Sync inactive: {err}"));
+                    }
+                }
+            });
+        }
+
         let mut app = Self {
             runtime,
+            service,
+            events,
+            sync_port,
             sessions: Vec::new(),
             selected_session: None,
             pages: Vec::new(),
@@ -274,10 +313,6 @@ impl RustySeoApp {
             return;
         }
 
-        let settings = AppSettings::load();
-        let max_pages = self.form.max_pages.max(1);
-        let concurrency = self.form.concurrency.clamp(1, 64);
-        let js = self.form.javascript;
         let name = {
             let trimmed = self.form.name.trim();
             if trimmed.is_empty() {
@@ -286,97 +321,28 @@ impl RustySeoApp {
                 Some(trimmed.to_string())
             }
         };
-
-        let session_id = match db::create_session(name.as_deref(), &url, Some(max_pages)) {
-            Ok(id) => Some(id),
-            Err(err) => {
-                self.status = format!("Could not create session: {err}");
-                None
-            }
+        let options = CrawlOptions {
+            url: url.clone(),
+            name,
+            max_pages: Some(self.form.max_pages.max(1)),
+            js: self.form.javascript,
         };
 
-        let (event_tx, event_rx) = channel::<CrawlEvent>();
-        let task_url = url.clone();
-
-        self.runtime.spawn(async move {
-            let mut engine = CrawlEngine::new()
-                .await
-                .with_max_pages(max_pages)
-                .with_concurrency(concurrency)
-                .with_robots(settings.crawler.respect_robots)
-                .with_crawl_delay(settings.crawler.respect_crawl_delay)
-                .with_nofollow(settings.crawler.respect_nofollow)
-                .with_noindex(settings.crawler.respect_noindex)
-                .with_js_fallback(settings.crawler.js_fallback)
-                .with_javascript(js)
-                .with_db_persistence(None);
-            if let Some(sid) = session_id {
-                engine = engine.with_session(sid);
+        match self.runtime.block_on(self.service.start_crawl(options)) {
+            Ok(session_id) => {
+                self.crawl = Some(LiveCrawl::new(url, Some(session_id)));
+                self.status = "Crawl started".to_string();
             }
-
-            let stats = engine.stats();
-            let _ = event_tx.send(CrawlEvent::Ready { stats });
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel(1000);
-            let engine_task = engine.clone();
-            let crawl_url = task_url.clone();
-            let handle =
-                tokio::spawn(async move { engine_task.crawl_concurrently(&crawl_url, tx).await });
-
-            let mut pages = 0usize;
-            let mut failed = 0usize;
-            while let Some(message) = rx.recv().await {
-                match message {
-                    CrawlMessage::Page(page) => {
-                        pages += 1;
-                        let code = page.status.get(..3).and_then(|c| c.parse::<u16>().ok());
-                        let is_failed = code.is_none_or(|c| c >= 400);
-                        if is_failed {
-                            failed += 1;
-                        }
-                        let _ = event_tx.send(CrawlEvent::Page {
-                            status: page.status.clone(),
-                            url: page.url.clone(),
-                            links: page.anchor_links.len(),
-                            failed: is_failed,
-                        });
-                    }
-                    CrawlMessage::Progress {
-                        scanned,
-                        queued,
-                        processing,
-                    } => {
-                        let _ = event_tx.send(CrawlEvent::Progress {
-                            scanned,
-                            queued,
-                            processing,
-                        });
-                    }
-                }
+            Err(err) => {
+                self.status = format!("Could not start crawl: {err}");
             }
-            let _ = handle.await;
-            if let Some(sid) = session_id {
-                let _ = db::finish_session(sid, "completed", pages, failed);
-            }
-            let _ = event_tx.send(CrawlEvent::Finished { pages, failed });
-        });
+        }
+    }
 
-        self.crawl = Some(LiveCrawl {
-            url,
-            max_pages,
-            session_id,
-            rx: event_rx,
-            stats: None,
-            started: Instant::now(),
-            pages: 0,
-            failed: 0,
-            scanned: 0,
-            queued: 0,
-            processing: 0,
-            recent: Vec::new(),
-            done: false,
-        });
-        self.status = "Crawl started".to_string();
+    pub fn stop_crawl(&mut self) {
+        if self.service.stop() {
+            self.status = "Stop requested; finishing in-flight requests…".to_string();
+        }
     }
 
     pub fn load_session(&mut self, id: i64) {
@@ -569,72 +535,89 @@ impl RustySeoApp {
             }
         }
 
-        let mut finished = false;
-        if let Some(crawl) = &mut self.crawl {
-            loop {
-                match crawl.rx.try_recv() {
-                    Ok(CrawlEvent::Ready { stats }) => crawl.stats = Some(stats),
-                    Ok(CrawlEvent::Page {
-                        status,
-                        url,
-                        links,
-                        failed,
-                    }) => {
-                        crawl.pages += 1;
-                        if failed {
-                            crawl.failed += 1;
+        // Live crawl events from the shared service (ours or an external one).
+        let mut ended: Option<Value> = None;
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => {
+                    let name = event
+                        .get("event")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    match name.as_str() {
+                        "crawl.start" => {
+                            if self.crawl.is_none() {
+                                let url = event["url"].as_str().unwrap_or("").to_string();
+                                let session_id = event["session_id"].as_i64();
+                                self.crawl = Some(LiveCrawl::new(url, session_id));
+                                self.status = "External crawl started — watching live".to_string();
+                            }
                         }
-                        crawl.recent.push(LivePage {
-                            status,
-                            url,
-                            links,
-                            failed,
-                        });
-                        if crawl.recent.len() > 500 {
-                            crawl.recent.remove(0);
+                        "page" => {
+                            if let Some(crawl) = &mut self.crawl {
+                                let status = event["status"].as_str().unwrap_or("").to_string();
+                                let code = status.get(..3).and_then(|c| c.parse::<u16>().ok());
+                                let failed = code.is_none_or(|c| c >= 400);
+                                crawl.recent.push(LivePage {
+                                    status,
+                                    url: event["url"].as_str().unwrap_or("").to_string(),
+                                    links: event["links"].as_u64().unwrap_or(0) as usize,
+                                    failed,
+                                    not_modified: event["not_modified"].as_bool() == Some(true),
+                                    js_rendered: event["js_rendered"].as_bool() == Some(true),
+                                });
+                                if crawl.recent.len() > 500 {
+                                    crawl.recent.remove(0);
+                                }
+                            }
                         }
-                    }
-                    Ok(CrawlEvent::Progress {
-                        scanned,
-                        queued,
-                        processing,
-                    }) => {
-                        crawl.scanned = scanned;
-                        crawl.queued = queued;
-                        crawl.processing = processing;
-                    }
-                    Ok(CrawlEvent::Finished { pages, failed }) => {
-                        crawl.pages = pages;
-                        crawl.failed = failed;
-                        crawl.done = true;
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        crawl.done = true;
-                        break;
+                        "crawl.end" => ended = Some(event),
+                        _ => {}
                     }
                 }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => break,
             }
-            finished = crawl.done;
         }
 
-        if finished {
-            let session_id = self.crawl.as_ref().and_then(|c| c.session_id);
-            let pages = self.crawl.as_ref().map(|c| c.pages).unwrap_or(0);
-            let robots = self
-                .crawl
-                .as_ref()
-                .and_then(|c| c.stats.as_ref())
-                .map(|s| s.robots_blocked())
+        // Keep live counters fresh from the service; treat a stopped service as
+        // crawl completion even if the end event was missed.
+        if let Some(crawl) = &mut self.crawl {
+            let status = self.service.status();
+            crawl.pages = status.pages;
+            crawl.failed = status.failed;
+            crawl.queued = status.queued;
+            crawl.processing = status.processing;
+            crawl.robots_blocked = status.robots_blocked;
+            crawl.js_renders = status.js_renders;
+            crawl.not_modified = status.not_modified;
+            crawl.stop_requested = status.stop_requested;
+            if !status.running && ended.is_none() {
+                ended = Some(Value::Null);
+            }
+        }
+
+        if let Some(event) = ended {
+            let session_id = event
+                .get("session_id")
+                .and_then(Value::as_i64)
+                .or_else(|| self.crawl.as_ref().and_then(|c| c.session_id));
+            let pages = event
+                .get("pages")
+                .and_then(Value::as_u64)
+                .map(|p| p as usize)
+                .or_else(|| self.crawl.as_ref().map(|c| c.pages))
                 .unwrap_or(0);
+            let outcome = event
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("completed")
+                .to_string();
             self.crawl = None;
             self.refresh_sessions();
-            let robots_note = if robots > 0 {
-                format!(", {robots} skipped by robots.txt")
-            } else {
-                String::new()
-            };
-            self.status = format!("Crawl finished: {pages} pages{robots_note}");
+            self.status = format!("Crawl {outcome}: {pages} pages");
             if let Some(id) = session_id {
                 self.load_session(id);
             }
