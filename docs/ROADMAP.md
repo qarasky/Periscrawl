@@ -32,16 +32,16 @@ Rules:
 
 ## Phases
 
-### Phase 1 — Core split + CLI foundations (in progress)
+### Phase 1 — Core split + CLI foundations (complete)
 
 - [x] Cargo workspace; extract `rustyseo-core` (crawler, db, settings, issues, ai, logging)
 - [x] `rustyseo` CLI v1: `crawl`, `config get/set/show/path/edit`, `doctor`
 - [x] NDJSON event stream (`--json-events`), documented exit codes
 - [x] Session schema + migrations (`sessions` table, per-session pages, `PRAGMA user_version`)
+- [x] robots.txt enforcement + adaptive rate limiter (respect_robots / respect_crawl_delay settings)
 - [x] `rustyseo sessions`, `rustyseo session <id> show|pages|issues` (human + `--json`)
 - [x] `rustyseo export <session> --format json|xlsx|csv` (core sheet builders + writers; `--tab` / `--out -` for agents)
-- [ ] Enforce robots.txt during crawling; wire the adaptive rate limiter
-- [ ] Precise `--max-pages` semantics (currently overshoots by up to concurrency)
+- [x] Precise `--max-pages` semantics (spawn-gated budget, no overshoot)
 
 ### Phase 2 — CLI v2 (agent surface)
 

@@ -9,6 +9,8 @@ use url::Url;
 
 use crate::crawler::fetching::fetch_and_process;
 use crate::crawler::helpers::html_parser::PageData;
+use crate::crawler::helpers::rate_limiter::AdaptiveRateLimiter;
+use crate::crawler::helpers::robots::{RobotsRules, fetch_robots};
 use crate::crawler::helpers::user_agents::user_agents;
 use crate::db;
 use crate::models::AppSettings;
@@ -33,6 +35,12 @@ pub struct CrawlEngine {
     db_batch_size: usize,
     /// When set, persisted pages are scoped to this crawl session.
     session_id: Option<i64>,
+    /// Respect robots.txt disallow rules while following links.
+    respect_robots: bool,
+    /// Honor robots.txt Crawl-delay directives.
+    respect_crawl_delay: bool,
+    /// Shared adaptive pacing for outgoing requests (429/5xx aware).
+    rate_limiter: Arc<AdaptiveRateLimiter>,
 }
 
 impl std::fmt::Debug for CrawlEngine {
@@ -88,6 +96,9 @@ impl CrawlEngine {
             pending_pages: Arc::new(Mutex::new(Vec::with_capacity(db_batch_size))),
             db_batch_size,
             session_id: None,
+            respect_robots: true,
+            respect_crawl_delay: false,
+            rate_limiter: Arc::new(AdaptiveRateLimiter::default_polite()),
         }
     }
 
@@ -147,6 +158,23 @@ impl CrawlEngine {
     pub fn with_session(mut self, session_id: i64) -> Self {
         self.session_id = Some(session_id);
         self
+    }
+
+    /// Respect robots.txt disallow rules while following links (default: on).
+    pub fn with_robots(mut self, respect: bool) -> Self {
+        self.respect_robots = respect;
+        self
+    }
+
+    /// Honor robots.txt Crawl-delay directives (default: off).
+    pub fn with_crawl_delay(mut self, respect: bool) -> Self {
+        self.respect_crawl_delay = respect;
+        self
+    }
+
+    /// Shared crawl statistics (same counters across clones).
+    pub fn stats(&self) -> crate::crawler::stats::CrawlStats {
+        self.stats.clone()
     }
 
     /// Flush pending pages to DB
@@ -239,6 +267,26 @@ impl CrawlEngine {
             Err(_) => return,
         };
 
+        // robots.txt enforcement: fetched once per crawl for the seed host;
+        // every dequeued URL (seed, discovered links, sitemaps) is checked.
+        let robots = if self.respect_robots {
+            fetch_robots(&self.client, &base_url).await
+        } else {
+            RobotsRules::allow_all()
+        };
+        let crawl_delay = if self.respect_crawl_delay {
+            robots.crawl_delay
+        } else {
+            None
+        };
+        if robots.has_rules() || crawl_delay.is_some() {
+            tracing::info!(
+                "[ROBOTS] Enforcement active: {} rule(s), crawl-delay {:?}",
+                robots.rule_count(),
+                crawl_delay
+            );
+        }
+
         //  new queue module for breadth-first crawling
         // Allow queue to hold more items than max_pages to account for the frontier
         // Factor of 10 allows building a backlog without dropping links too early
@@ -270,8 +318,8 @@ impl CrawlEngine {
                     // Only add URLs from the same domain
                     if let Ok(parsed) = Url::parse(&url) {
                         if crate::crawler::url_normalizer::is_same_domain(
-                            parsed.domain(),
-                            base_url.domain(),
+                            parsed.host_str(),
+                            base_url.host_str(),
                         ) {
                             if let Some(normalized_url) =
                                 crate::crawler::url_normalizer::normalize_url(&url)
@@ -300,15 +348,28 @@ impl CrawlEngine {
         }
 
         let mut join_set = tokio::task::JoinSet::new();
+        // Counts spawned fetch tasks, not completed pages: gating on this makes
+        // `max_pages` an exact budget instead of overshooting by however many
+        // requests happened to be in flight when the previous limit was hit.
+        let mut spawned: usize = 0;
 
         while !queue.is_empty() || !join_set.is_empty() {
             // Fill up our concurrency quota
             while !queue.is_empty() && join_set.len() < self.concurrency_limit {
-                if self.success_count.load(Ordering::SeqCst) >= self.max_pages {
+                if spawned >= self.max_pages {
                     break;
                 }
 
                 let (normalized_url, referer) = queue.pop().unwrap();
+
+                // robots.txt enforcement happens at dequeue time so every URL
+                // source (seed, links, sitemaps) is covered by one check.
+                if !robots.is_allowed(&normalized_url) {
+                    self.stats.increment_robots_blocked();
+                    tracing::debug!("[ROBOTS] Skipping disallowed URL: {}", normalized_url);
+                    continue;
+                }
+                spawned += 1;
 
                 // URLs in queue are already normalized, filtered, and marked "seen" (visited)
                 // We proceed directly to processing
@@ -321,7 +382,11 @@ impl CrawlEngine {
                         .acquire()
                         .await
                         .map_err(|e| e.to_string())?;
-                    fetch_and_process(
+                    engine.rate_limiter.acquire().await;
+                    if let Some(delay) = crawl_delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let result = fetch_and_process(
                         &engine.client,
                         &engine.browser,
                         &engine.user_agents,
@@ -331,7 +396,17 @@ impl CrawlEngine {
                         &base_url_clone,
                         referer,
                     )
-                    .await
+                    .await;
+                    match result.as_ref() {
+                        Ok(data)
+                            if data.status.starts_with("429") || data.status.starts_with('5') =>
+                        {
+                            engine.rate_limiter.on_throttled(None);
+                        }
+                        Ok(_) => engine.rate_limiter.on_success(),
+                        Err(_) => {}
+                    }
+                    result
                 });
             }
 
@@ -497,8 +572,9 @@ impl CrawlEngine {
                 }
             }
 
-            // If we hit max pages, we stop spawning but finish existing ones
-            if self.success_count.load(Ordering::SeqCst) >= self.max_pages {
+            // Reached the page budget: stop spawning new fetches; just drain
+            // the tasks that are already in flight.
+            if spawned >= self.max_pages {
                 queue.clear();
             }
 

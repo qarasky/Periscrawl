@@ -84,6 +84,8 @@ impl App {
                 .with_max_pages(settings.crawler.max_pages)
                 .with_concurrency(settings.crawler.concurrency)
                 .with_javascript(settings.crawler.enable_javascript)
+                .with_robots(settings.crawler.respect_robots)
+                .with_crawl_delay(settings.crawler.respect_crawl_delay)
                 .with_pagespeed(Some(settings.connectors.pagespeed));
 
             crawler.crawl_concurrently(&url, tx).await;

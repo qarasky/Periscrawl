@@ -64,7 +64,7 @@ impl AdaptiveRateLimiter {
     pub fn on_success(&self) {
         let _ = self
             .delay_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
                 Some(((d as f64 * 0.95) as u64).max(self.min_delay_ms))
             });
     }
@@ -74,7 +74,7 @@ impl AdaptiveRateLimiter {
         let retry_after_ms = retry_after.map(|d| d.as_millis() as u64).unwrap_or(0);
         let _ = self
             .delay_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
                 let doubled = (d.max(self.min_delay_ms) * 2).min(self.max_delay_ms);
                 Some(doubled.max(retry_after_ms).min(self.max_delay_ms))
             });

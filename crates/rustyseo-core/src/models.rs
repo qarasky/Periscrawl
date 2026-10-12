@@ -40,6 +40,16 @@ pub struct CrawlerConfig {
     pub batch_size: usize,
     #[serde(default)]
     pub check_external_links: bool,
+    /// Respect robots.txt disallow rules when following links.
+    #[serde(default = "default_true")]
+    pub respect_robots: bool,
+    /// Honor robots.txt Crawl-delay directives (slower, politer crawls).
+    #[serde(default)]
+    pub respect_crawl_delay: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,6 +123,8 @@ impl Default for AppSettings {
                 extractor_text: "".to_string(),
                 batch_size: 50,
                 check_external_links: false,
+                respect_robots: true,
+                respect_crawl_delay: false,
             },
             ui: UiConfig {
                 theme: "Oceanic".to_string(),

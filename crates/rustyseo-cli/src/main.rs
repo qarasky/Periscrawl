@@ -164,6 +164,16 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Logs go to stderr so `--json-events` stdout stays machine-parseable.
+    // Set RUST_LOG=info|debug for diagnostics.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let cli = Cli::parse();
     match run(cli).await {
         Ok(code) => code,
@@ -218,7 +228,9 @@ async fn crawl(
     let mut engine = CrawlEngine::new()
         .await
         .with_max_pages(effective_max_pages)
-        .with_concurrency(concurrency.unwrap_or(settings.crawler.concurrency));
+        .with_concurrency(concurrency.unwrap_or(settings.crawler.concurrency))
+        .with_robots(settings.crawler.respect_robots)
+        .with_crawl_delay(settings.crawler.respect_crawl_delay);
 
     if js {
         engine = engine.with_javascript(true);
@@ -296,6 +308,8 @@ async fn crawl(
         db::finish_session(sid, "completed", pages, failed)?;
     }
 
+    let robots_blocked = engine.stats().robots_blocked();
+
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;
 
@@ -308,6 +322,7 @@ async fn crawl(
                 "session_id": session_id,
                 "pages": pages,
                 "failed": failed,
+                "robots_blocked": robots_blocked,
                 "elapsed_ms": elapsed_ms,
                 "db": !no_db,
             })
@@ -316,8 +331,13 @@ async fn crawl(
         let session_note = session_id
             .map(|sid| format!(" (session {sid})"))
             .unwrap_or_default();
+        let robots_note = if robots_blocked > 0 {
+            format!(", {robots_blocked} skipped by robots.txt")
+        } else {
+            String::new()
+        };
         println!(
-            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s{session_note}",
+            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s{session_note}{robots_note}",
             elapsed.as_secs_f64()
         );
     }

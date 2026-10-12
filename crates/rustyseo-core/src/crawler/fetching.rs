@@ -17,8 +17,6 @@ pub async fn fetch_and_process(
     base_url: &Url,
     referer: Option<String>,
 ) -> Result<PageData, String> {
-    apply_jitter().await;
-
     let mut page_data = if enable_javascript {
         if let Some(browser) = browser {
             fetch_js(url, base_url, browser.clone()).await?
@@ -248,8 +246,8 @@ async fn fetch_standard(
             if let Ok(mut abs_url) = final_url.join(&link.href) {
                 // Check domain against base_url (crawl scope) using loose comparison
                 if crate::crawler::url_normalizer::is_same_domain(
-                    abs_url.domain(),
-                    base_url.domain(),
+                    abs_url.host_str(),
+                    base_url.host_str(),
                 ) {
                     // Start by clearing fragment
                     abs_url.set_fragment(None);
@@ -342,8 +340,8 @@ async fn fetch_js(url: &str, base_url: &Url, browser: Arc<Browser>) -> Result<Pa
         .filter_map(|link| {
             if let Ok(mut abs_url) = current_page_url.join(&link.href) {
                 if crate::crawler::url_normalizer::is_same_domain(
-                    abs_url.domain(),
-                    base_url.domain(),
+                    abs_url.host_str(),
+                    base_url.host_str(),
                 ) {
                     abs_url.set_fragment(None);
 
@@ -436,11 +434,6 @@ async fn fetch_pagespeed_data(
         speed_index: get_display_value("speed-index"),
         performance_score: format!("{:.0}", score),
     })
-}
-
-async fn apply_jitter() {
-    let jitter = rand::rng().random_range(100..=500);
-    sleep(Duration::from_millis(jitter)).await;
 }
 
 fn pick_random_user_agent(user_agents: &[String]) -> String {
