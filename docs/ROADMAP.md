@@ -39,6 +39,7 @@ Rules:
 - [x] NDJSON event stream (`--json-events`), documented exit codes
 - [x] Session schema + migrations (`sessions` table, per-session pages, `PRAGMA user_version`)
 - [x] robots.txt enforcement + adaptive rate limiter (respect_robots / respect_crawl_delay settings)
+- [x] Smart JS rendering fallback (render when client-framework markers meet sparse content)
 - [x] `rustyseo sessions`, `rustyseo session <id> show|pages|issues` (human + `--json`)
 - [x] `rustyseo export <session> --format json|xlsx|csv` (core sheet builders + writers; `--tab` / `--out -` for agents)
 - [x] Precise `--max-pages` semantics (spawn-gated budget, no overshoot)
