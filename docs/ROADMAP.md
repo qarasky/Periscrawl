@@ -51,12 +51,13 @@ Rules:
 
 ### Phase 3 — GUI (egui)
 
-- [ ] Crawl dashboard: live progress, per-tab data tables (internal/external
-      links, redirects, images, CSS/JS, content, CWV, files)
-- [ ] Issue audit view with severity filtering
-- [ ] Page detail pane, exports, crawl history + diff view
-- [ ] PageSpeed Insights / CWV integration
+- [x] GUI crate: session browser, crawl form, live crawl view (progress + page stream),
+      per-sheet data tables with text filtering, export buttons (xlsx / CSVs / json)
+- [ ] Page detail pane (click a row), CWV and Content tabs, column sorting
+- [ ] Issue audit: severity levels + filtering
+- [ ] Crawl diff view (compare two sessions)
 - [ ] Settings & connectors screens
+- [ ] Packaged app bundles (macOS .app / Windows .exe / Linux) with icons
 
 ### Phase 4 — Sync + agent-native
 
