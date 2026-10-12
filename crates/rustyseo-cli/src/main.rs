@@ -3,9 +3,10 @@
 //! Exit codes:
 //!   0  success
 //!   1  fatal error (bad args, engine/session failure)
-//!   2  crawl produced no pages
+//!   2  crawl produced no pages / no sitemap entries
 //!   3  config key not found
-//!   6  regressions detected (with `crawl --compare` or `diff --fail-on-regressions`)
+//!   6  regressions or sitemap findings detected (`crawl --compare`,
+//!      `diff --fail-on-regressions`, `sitemap`)
 //!   7  `watch` timed out
 //!
 //! With `--json-events`, crawl emits newline-delimited JSON on stdout:
@@ -207,6 +208,24 @@ enum Command {
 
     /// Run an MCP (Model Context Protocol) server over stdio for AI agents.
     Mcp,
+
+    /// Validate a site's sitemap: check every listed URL's status.
+    Sitemap {
+        /// Start URL, e.g. https://example.com
+        url: String,
+
+        /// Concurrent checks.
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+
+        /// Cap the number of entries checked.
+        #[arg(long)]
+        max_urls: Option<usize>,
+
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -350,7 +369,98 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             mcp::serve().await?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Sitemap {
+            url,
+            concurrency,
+            max_urls,
+            json,
+        } => sitemap_command(&url, concurrency, max_urls, json).await,
     }
+}
+
+async fn sitemap_command(
+    url: &str,
+    concurrency: usize,
+    max_urls: Option<usize>,
+    json_output: bool,
+) -> anyhow::Result<ExitCode> {
+    let report = rustyseo_core::audit::validate_sitemap(url, concurrency, max_urls)
+        .await
+        .map_err(anyhow::Error::msg)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Sitemap check for {}", report.start_url);
+        println!("  entries checked : {}", report.entries);
+        println!("  ok              : {}", report.ok);
+        println!("  redirects       : {}", report.redirects.len());
+        println!("  dead (4xx/5xx)  : {}", report.dead.len());
+        println!("  network errors  : {}", report.errors.len());
+        if let Some(cap) = report.truncated_at {
+            println!("  (capped at {cap} entries)");
+        }
+
+        if !report.dead.is_empty() {
+            println!("\nDead entries (first 50):");
+            for entry in report.dead.iter().take(50) {
+                let suffix = if entry.hops > 0 {
+                    format!(" (via {} redirect(s))", entry.hops)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  [{}] {}{}",
+                    entry
+                        .final_status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    entry.url,
+                    suffix
+                );
+            }
+            if report.dead.len() > 50 {
+                println!("  … and {} more", report.dead.len() - 50);
+            }
+        }
+
+        if !report.redirects.is_empty() {
+            println!("\nRedirects (first 10):");
+            for entry in report.redirects.iter().take(10) {
+                println!(
+                    "  [{} → {}] {}{}",
+                    entry.status.unwrap_or(0),
+                    entry.final_status.unwrap_or(0),
+                    entry.url,
+                    entry
+                        .location
+                        .as_ref()
+                        .map(|location| format!(" → {location}"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+
+        if !report.errors.is_empty() {
+            println!("\nNetwork errors (first 10):");
+            for entry in report.errors.iter().take(10) {
+                println!(
+                    "  {} — {}",
+                    entry.url,
+                    entry.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
+    }
+
+    if report.entries == 0 {
+        eprintln!("no sitemap entries found for {url}");
+        return Ok(ExitCode::from(2));
+    }
+    if report.problem_count() > 0 {
+        return Ok(ExitCode::from(6));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 struct CrawlArgs {

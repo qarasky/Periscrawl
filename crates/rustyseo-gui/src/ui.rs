@@ -499,9 +499,15 @@ fn sheet_table(
 
     // Horizontal scrolling: all columns get explicit widths; the scroll area
     // provides the horizontal scrollbar when their sum exceeds the viewport.
+    // Drag-to-scroll is disabled so a slightly-moving click is never turned
+    // into a table pan (which also cancels the click).
     egui::ScrollArea::horizontal()
         .id_salt(("hscroll", sheet_name.clone()))
         .auto_shrink([false, false])
+        .scroll_source(egui::containers::scroll_area::ScrollSource {
+            drag: egui::containers::scroll_area::DragScroll::Never,
+            ..Default::default()
+        })
         .show(ui, |ui| {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
@@ -558,9 +564,14 @@ fn sheet_table(
                         let is_selected = selected_url
                             .is_some_and(|url| data_row.iter().any(|cell| cell == url));
                         row.set_selected(is_selected);
-                        if row.response().clicked() {
-                            *clicked_target =
-                                click_target_for(&sheet_name, data_row);
+                        // Open details on pointer *press*: egui cancels a
+                        // `clicked()` when the pointer moves a few pixels
+                        // between press and release (trackpad jitter makes
+                        // this feel random), so press-driven opening gives
+                        // a stable single-click interaction.
+                        let response = row.response();
+                        if response.clicked() || response.is_pointer_button_down_on() {
+                            *clicked_target = click_target_for(&sheet_name, data_row);
                         }
                     });
                 });
@@ -660,6 +671,10 @@ fn diff_body(app: &mut RustySeoApp, ui: &mut egui::Ui) {
     egui::ScrollArea::horizontal()
         .id_salt("diff_hscroll")
         .auto_shrink([false, false])
+        .scroll_source(egui::containers::scroll_area::ScrollSource {
+            drag: egui::containers::scroll_area::DragScroll::Never,
+            ..Default::default()
+        })
         .show(ui, |ui| {
             let table = TableBuilder::new(ui)
                 .striped(true)
@@ -708,7 +723,9 @@ fn diff_body(app: &mut RustySeoApp, ui: &mut egui::Ui) {
                                 .join("  •  ");
                             ui.label(summary);
                         });
-                        if row.response().clicked() {
+                        if row.response().clicked()
+                            || row.response().is_pointer_button_down_on()
+                        {
                             clicked = Some(index);
                         }
                     });

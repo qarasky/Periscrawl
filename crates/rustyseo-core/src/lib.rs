@@ -5,6 +5,7 @@
 //! top of it.
 
 pub mod ai;
+pub mod audit;
 pub mod crawler;
 pub mod db;
 pub mod diff;

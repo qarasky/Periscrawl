@@ -81,6 +81,8 @@ Rules:
 
 ### Phase 5 — Feature ports (from the pre-closed-source design)
 
+- [x] Sitemap validator (`rustyseo sitemap`): HEAD-checks every sitemap entry with
+      redirect-chain awareness; exit 6 when dead entries are found
 - [ ] Log analyzer (Nginx/Apache): bot vs human, status/filetype breakdowns,
       crawl-budget views
 - [ ] GSC / GA4 / Clarity connectors
