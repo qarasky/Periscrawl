@@ -7,6 +7,45 @@ use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use url::Url;
 
+/// Conditional-request validators captured from a previous crawl.
+#[derive(Debug, Clone, Default)]
+pub struct FetchValidators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// Outcome of fetching one URL.
+pub enum FetchOutcome {
+    Fetched(PageData),
+    /// Server answered 304: reuse the stored page from the baseline session.
+    NotModified,
+}
+
+/// Extract ETag / Last-Modified validators from a stored page's headers.
+pub fn validators_from(page: &PageData) -> Option<FetchValidators> {
+    let mut validators = FetchValidators::default();
+    for header in &page.headers {
+        if let Some((name, value)) = header.split_once(':') {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "etag" => validators.etag = Some(value.trim().to_string()),
+                "last-modified" => validators.last_modified = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    if validators.etag.is_none() && validators.last_modified.is_none() {
+        None
+    } else {
+        Some(validators)
+    }
+}
+
+/// Internal result of a plain (non-JS) fetch.
+enum StandardFetch {
+    Page(PageData, String),
+    NotModified,
+}
+
 pub async fn fetch_and_process(
     client: &Client,
     browser: &Option<Arc<Browser>>,
@@ -14,44 +53,51 @@ pub async fn fetch_and_process(
     pagespeed_config: &Option<crate::models::PageSpeedConfig>,
     enable_javascript: bool,
     js_fallback: bool,
+    validators: Option<&FetchValidators>,
     url: &str,
     base_url: &Url,
     referer: Option<String>,
-) -> Result<PageData, String> {
+) -> Result<FetchOutcome, String> {
     let mut page_data = if enable_javascript {
         if let Some(browser) = browser {
             fetch_js(url, base_url, browser.clone()).await?
         } else {
-            fetch_standard(client, user_agents, url, base_url, referer).await?.0
+            match fetch_standard(client, user_agents, url, base_url, referer, None).await? {
+                StandardFetch::Page(data, _) => data,
+                StandardFetch::NotModified => return Ok(FetchOutcome::NotModified),
+            }
         }
     } else {
-        let (standard, html) =
-            fetch_standard(client, user_agents, url, base_url, referer).await?;
-        if js_fallback && should_render_js(&standard, &html) {
-            if let Some(browser) = browser {
-                tracing::info!(
-                    "[JS-FALLBACK] Rendering {} (client-side framework markers or sparse content)",
-                    standard.url
-                );
-                match fetch_js(url, base_url, browser.clone()).await {
-                    Ok(mut rendered) => {
-                        merge_rendered(&mut rendered, &standard);
-                        rendered
-                    }
-                    Err(err) => {
-                        tracing::warn!("[JS-FALLBACK] Render failed for {}: {}", url, err);
+        match fetch_standard(client, user_agents, url, base_url, referer, validators).await? {
+            StandardFetch::NotModified => return Ok(FetchOutcome::NotModified),
+            StandardFetch::Page(standard, html) => {
+                if js_fallback && should_render_js(&standard, &html) {
+                    if let Some(browser) = browser {
+                        tracing::info!(
+                            "[JS-FALLBACK] Rendering {} (client-side framework markers or sparse content)",
+                            standard.url
+                        );
+                        match fetch_js(url, base_url, browser.clone()).await {
+                            Ok(mut rendered) => {
+                                merge_rendered(&mut rendered, &standard);
+                                rendered
+                            }
+                            Err(err) => {
+                                tracing::warn!("[JS-FALLBACK] Render failed for {}: {}", url, err);
+                                standard
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "[JS-FALLBACK] {} looks client-rendered but no browser is available",
+                            standard.url
+                        );
                         standard
                     }
+                } else {
+                    standard
                 }
-            } else {
-                tracing::warn!(
-                    "[JS-FALLBACK] {} looks client-rendered but no browser is available",
-                    standard.url
-                );
-                standard
             }
-        } else {
-            standard
         }
     };
 
@@ -74,7 +120,7 @@ pub async fn fetch_and_process(
         }
     }
 
-    Ok(page_data)
+    Ok(FetchOutcome::Fetched(page_data))
 }
 
 async fn fetch_standard(
@@ -83,7 +129,8 @@ async fn fetch_standard(
     url: &str,
     base_url: &Url,
     referer: Option<String>,
-) -> Result<(PageData, String), String> {
+    validators: Option<&FetchValidators>,
+) -> Result<StandardFetch, String> {
     let mut current_url = url.to_string();
     let mut redirect_chain = Vec::new();
     let mut hops = 0;
@@ -112,6 +159,14 @@ async fn fetch_standard(
 
         if let Some(ref_url) = referer.as_ref() {
             request = request.header("Referer", ref_url);
+        }
+        if let Some(validators) = validators {
+            if let Some(etag) = &validators.etag {
+                request = request.header("If-None-Match", etag);
+            }
+            if let Some(last_modified) = &validators.last_modified {
+                request = request.header("If-Modified-Since", last_modified);
+            }
         }
 
         match request.send().await {
@@ -200,6 +255,14 @@ async fn fetch_standard(
 
     let status_code = response.status();
     tracing::info!("[FETCH] {} -> STATUS: {}", url, status_code);
+
+    if status_code.as_u16() == 304 {
+        tracing::info!(
+            "[FETCH] {} -> 304 Not Modified (reusing stored content)",
+            url
+        );
+        return Ok(StandardFetch::NotModified);
+    }
 
     let headers_list: Vec<String> = response
         .headers()
@@ -308,7 +371,7 @@ async fn fetch_standard(
         url
     );
 
-    Ok((page_data, html_content))
+    Ok(StandardFetch::Page(page_data, html_content))
 }
 
 /// Heuristic: does this page look like it needs client-side rendering?
@@ -517,7 +580,7 @@ fn pick_random_user_agent(user_agents: &[String]) -> String {
 
 #[cfg(test)]
 mod fallback_tests {
-    use super::should_render_js;
+    use super::{should_render_js, validators_from};
     use crate::crawler::helpers::html_parser::{PageData, extract_page_elements};
 
     fn page_with_words(words: usize) -> PageData {
@@ -567,5 +630,25 @@ mod fallback_tests {
         let html =
             r#"<html><body><div id="app" data-server-rendered="true"><div id="app"></div></div><script data-v-1234abcd></script></body></html>"#;
         assert!(should_render_js(&page, html));
+    }
+
+    #[test]
+    fn validators_extracted_from_stored_headers() {
+        let mut page = page_with_words(1);
+        page.headers = vec![
+            "Content-Type: text/html".to_string(),
+            "ETag: \"abc123\"".to_string(),
+            "Last-Modified: Wed, 21 Oct 2026 07:28:00 GMT".to_string(),
+        ];
+        let validators = validators_from(&page).expect("validators");
+        assert_eq!(validators.etag.as_deref(), Some("\"abc123\""));
+        assert_eq!(
+            validators.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+
+        let mut bare = page_with_words(1);
+        bare.headers = vec!["Content-Type: text/html".to_string()];
+        assert!(validators_from(&bare).is_none());
     }
 }

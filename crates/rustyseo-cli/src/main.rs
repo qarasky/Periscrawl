@@ -61,6 +61,12 @@ enum Command {
         #[arg(long, value_name = "SESSION")]
         resume: Option<i64>,
 
+        /// Incremental re-crawl: use this session's stored pages (ETag /
+        /// Last-Modified headers) so unchanged pages answer 304 and are
+        /// reused instead of re-downloaded. Requires the database.
+        #[arg(long, value_name = "SESSION", conflicts_with = "resume")]
+        since: Option<i64>,
+
         /// After crawling, diff against this baseline session and exit 6 when
         /// regressions are found (removed pages, new 4xx/5xx, newly noindexed).
         #[arg(long, value_name = "SESSION")]
@@ -249,6 +255,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             js,
             js_fallback,
             resume,
+            since,
             compare,
             no_db,
             quiet,
@@ -262,6 +269,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 js,
                 js_fallback,
                 resume,
+                since,
                 compare,
                 no_db,
                 quiet,
@@ -301,6 +309,7 @@ struct CrawlArgs {
     js: bool,
     js_fallback: bool,
     resume: Option<i64>,
+    since: Option<i64>,
     compare: Option<i64>,
     no_db: bool,
     quiet: bool,
@@ -316,6 +325,7 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
         js,
         js_fallback,
         resume,
+        since,
         compare,
         no_db,
         quiet,
@@ -325,6 +335,10 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
 
     if resume.is_some() && no_db {
         eprintln!("error: --resume requires the database (remove --no-db)");
+        return Ok(ExitCode::FAILURE);
+    }
+    if since.is_some() && no_db {
+        eprintln!("error: --since requires the database (remove --no-db)");
         return Ok(ExitCode::FAILURE);
     }
     if compare.is_some() && no_db {
@@ -355,6 +369,24 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
     }
     if use_js_fallback {
         engine = engine.with_js_fallback(true);
+    }
+
+    // Incremental re-crawl: a previous session's pages provide ETag /
+    // Last-Modified validators so unchanged pages answer 304 and reuse their
+    // stored content instead of being re-downloaded.
+    if let Some(baseline_id) = since {
+        let Some(baseline_session) = db::get_session(baseline_id)? else {
+            eprintln!("session {baseline_id} not found");
+            return Ok(ExitCode::FAILURE);
+        };
+        let baseline_pages = db::load_session_pages(baseline_id)?;
+        tracing::info!(
+            "[INCREMENTAL] baseline session {} — {} stored pages ({})",
+            baseline_id,
+            baseline_pages.len(),
+            baseline_session.start_url
+        );
+        engine = engine.with_incremental_baseline(baseline_pages);
     }
 
     // Session handling: fresh session, resumed session, or none.
@@ -448,6 +480,7 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
     let stats = engine.stats();
     let robots_blocked = stats.robots_blocked();
     let js_renders = stats.js_renders();
+    let not_modified = stats.not_modified();
 
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;
@@ -463,6 +496,7 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
                 "failed": failed,
                 "robots_blocked": robots_blocked,
                 "js_renders": js_renders,
+                "not_modified": not_modified,
                 "elapsed_ms": elapsed_ms,
                 "db": !no_db,
             })
@@ -481,8 +515,13 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
         } else {
             String::new()
         };
+        let cached_note = if not_modified > 0 {
+            format!(", {not_modified} unchanged (304, reused stored content)")
+        } else {
+            String::new()
+        };
         println!(
-            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s{session_note}{robots_note}{js_note}",
+            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s{session_note}{robots_note}{js_note}{cached_note}",
             elapsed.as_secs_f64()
         );
     }

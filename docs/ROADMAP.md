@@ -44,14 +44,15 @@ Rules:
 - [x] `rustyseo export <session> --format json|xlsx|csv` (core sheet builders + writers; `--tab` / `--out -` for agents)
 - [x] Precise `--max-pages` semantics (spawn-gated budget, no overshoot)
 
-### Phase 2 — CLI v2 (agent surface)
+### Phase 2 — CLI v2 (complete)
 
 - [x] JSON output everywhere with `--fields` projection; documented exit codes
 - [x] `rustyseo crawl --resume <session>` (continue interrupted crawls; page ids continue safely)
 - [x] Crawl diffing: `rustyseo diff a b`, plus `crawl --compare <baseline>` with
       regression exit code 6 (removed pages, new 4xx/5xx, newly noindexed)
 - [x] Scheduled-automation ergonomics: `--quiet`, NDJSON events, regression gating
-- [ ] Incremental re-crawls (conditional requests: skip unchanged pages via ETag/Last-Modified)
+- [x] Incremental re-crawls: `crawl --since <session>` uses ETag / Last-Modified
+      (304 → stored content reused, `not_modified` reported per page)
 
 ### Phase 3 — GUI (egui)
 

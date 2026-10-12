@@ -1,13 +1,13 @@
 use headless_chrome::{Browser, LaunchOptions};
 use reqwest::Client;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::Duration;
 use url::Url;
 
-use crate::crawler::fetching::fetch_and_process;
+use crate::crawler::fetching::{FetchOutcome, fetch_and_process, validators_from};
 use crate::crawler::helpers::html_parser::PageData;
 use crate::crawler::helpers::rate_limiter::AdaptiveRateLimiter;
 use crate::crawler::helpers::robots::{RobotsRules, fetch_robots};
@@ -49,6 +49,9 @@ pub struct CrawlEngine {
     resume_pages: Option<Arc<Vec<PageData>>>,
     /// Highest page id already stored for this session (0 for fresh crawls).
     id_base: usize,
+    /// Baseline pages from a previous session for conditional requests
+    /// (incremental re-crawls). Keyed by normalized URL.
+    incremental: Option<Arc<HashMap<String, PageData>>>,
     /// Shared adaptive pacing for outgoing requests (429/5xx aware).
     rate_limiter: Arc<AdaptiveRateLimiter>,
 }
@@ -113,6 +116,7 @@ impl CrawlEngine {
             js_fallback: false,
             resume_pages: None,
             id_base: 0,
+            incremental: None,
             rate_limiter: Arc::new(AdaptiveRateLimiter::default_polite()),
         }
     }
@@ -226,6 +230,26 @@ impl CrawlEngine {
         // never overwrite already-persisted rows of the same session.
         self.id_base = pages.iter().map(|page| page.id).max().unwrap_or(0);
         self.resume_pages = Some(Arc::new(pages));
+        self
+    }
+
+    /// Re-crawl incrementally: pages from a previous session provide
+    /// ETag / Last-Modified validators, and 304 responses reuse that stored
+    /// content instead of re-downloading it.
+    pub fn with_incremental_baseline(mut self, pages: Vec<PageData>) -> Self {
+        let mut baseline: HashMap<String, PageData> = HashMap::with_capacity(pages.len());
+        for page in pages {
+            if !page.requested_url.is_empty() {
+                let requested =
+                    crate::crawler::url_normalizer::normalize_url(&page.requested_url)
+                        .unwrap_or_else(|| page.requested_url.clone());
+                baseline.insert(requested, page.clone());
+            }
+            let key =
+                crate::crawler::url_normalizer::normalize_url(&page.url).unwrap_or_else(|| page.url.clone());
+            baseline.insert(key, page);
+        }
+        self.incremental = Some(Arc::new(baseline));
         self
     }
 
@@ -471,18 +495,44 @@ impl CrawlEngine {
                     if let Some(delay) = crawl_delay {
                         tokio::time::sleep(delay).await;
                     }
-                    let result = fetch_and_process(
+                    let validators = engine
+                        .incremental
+                        .as_ref()
+                        .and_then(|baseline| baseline.get(&normalized_url))
+                        .and_then(validators_from);
+                    let result = match fetch_and_process(
                         &engine.client,
                         &engine.browser,
                         &engine.user_agents,
                         &engine.pagespeed_config,
                         engine.enable_javascript,
                         engine.js_fallback,
+                        validators.as_ref(),
                         &normalized_url,
                         &base_url_clone,
                         referer,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(FetchOutcome::Fetched(data)) => Ok(data),
+                        Ok(FetchOutcome::NotModified) => {
+                            match engine
+                                .incremental
+                                .as_ref()
+                                .and_then(|baseline| baseline.get(&normalized_url))
+                            {
+                                Some(stored) => {
+                                    let mut data = stored.clone();
+                                    data.not_modified = true;
+                                    Ok(data)
+                                }
+                                None => Err(
+                                    "304 Not Modified without a stored baseline page".to_string()
+                                ),
+                            }
+                        }
+                        Err(err) => Err(err),
+                    };
                     match result.as_ref() {
                         Ok(data)
                             if data.status.starts_with("429") || data.status.starts_with('5') =>
@@ -524,6 +574,9 @@ impl CrawlEngine {
                         }
                         if data.js_rendered {
                             self.stats.increment_js_render();
+                        }
+                        if data.not_modified {
+                            self.stats.increment_not_modified();
                         }
 
                         // Extract new links BEFORE sending result to ensure consistency

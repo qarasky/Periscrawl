@@ -13,6 +13,7 @@ pub struct CrawlStats {
     pub links_duplicate: Arc<AtomicUsize>,
     pub robots_blocked: Arc<AtomicUsize>,
     pub js_renders: Arc<AtomicUsize>,
+    pub not_modified: Arc<AtomicUsize>,
 }
 
 impl CrawlStats {
@@ -25,6 +26,7 @@ impl CrawlStats {
             links_duplicate: Arc::new(AtomicUsize::new(0)),
             robots_blocked: Arc::new(AtomicUsize::new(0)),
             js_renders: Arc::new(AtomicUsize::new(0)),
+            not_modified: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -64,9 +66,17 @@ impl CrawlStats {
         self.js_renders.load(Ordering::SeqCst)
     }
 
+    pub fn increment_not_modified(&self) {
+        self.not_modified.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn not_modified(&self) -> usize {
+        self.not_modified.load(Ordering::SeqCst)
+    }
+
     pub fn get_summary(&self) -> String {
         format!(
-            "Crawled: {}, Failed: {}, Links Found: {}, Filtered: {}, Duplicates: {}, Robots Blocked: {}, JS Renders: {}, Batch Size Intertion: {}",
+            "Crawled: {}, Failed: {}, Links Found: {}, Filtered: {}, Duplicates: {}, Robots Blocked: {}, JS Renders: {}, Not Modified: {}, Batch Size Intertion: {}",
             self.pages_crawled.load(Ordering::SeqCst),
             self.pages_failed.load(Ordering::SeqCst),
             self.links_discovered.load(Ordering::SeqCst),
@@ -74,6 +84,7 @@ impl CrawlStats {
             self.links_duplicate.load(Ordering::SeqCst),
             self.robots_blocked.load(Ordering::SeqCst),
             self.js_renders.load(Ordering::SeqCst),
+            self.not_modified.load(Ordering::SeqCst),
             AppSettings::load().crawler.batch_size
         )
     }

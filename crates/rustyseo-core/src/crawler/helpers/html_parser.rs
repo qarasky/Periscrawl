@@ -128,6 +128,10 @@ pub struct PageData {
     /// (forced JS mode or the smart JS fallback), not the raw HTTP response.
     #[serde(default)]
     pub js_rendered: bool,
+    /// True when the server answered 304 and the stored content from a
+    /// previous session was reused (incremental re-crawls).
+    #[serde(default)]
+    pub not_modified: bool,
     pub extraction: Option<ExtractionResult>,
     pub redirect_chain: Vec<crate::models::RedirectHop>,
 }
@@ -411,6 +415,7 @@ pub fn extract_page_elements(document: &Html) -> PageData {
         extraction,
         redirect_chain: vec![],
         js_rendered: false,
+        not_modified: false,
     }
 }
 
