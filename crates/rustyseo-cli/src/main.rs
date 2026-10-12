@@ -81,6 +81,25 @@ enum Command {
         action: SessionAction,
     },
 
+    /// Export a session as xlsx, CSV (single sheet or zip) or JSON.
+    Export {
+        /// Session id (see `rustyseo sessions`).
+        session: i64,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ExportFormat::Xlsx)]
+        format: ExportFormat,
+
+        /// Output path. Use `-` to print JSON to stdout. Defaults to the
+        /// exports directory (~/…/rustyseo/exports).
+        #[arg(long)]
+        out: Option<String>,
+
+        /// Export a single sheet as CSV, e.g. --tab "Internal Links".
+        #[arg(long)]
+        tab: Option<String>,
+    },
+
     /// Inspect or edit the settings file.
     Config {
         #[command(subcommand)]
@@ -122,6 +141,13 @@ enum SessionAction {
     },
 }
 
+#[derive(Clone, clap::ValueEnum)]
+enum ExportFormat {
+    Json,
+    Xlsx,
+    Csv,
+}
+
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Print the settings file path.
@@ -161,6 +187,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         } => crawl(&url, max_pages, concurrency, js, no_db, json_events, name).await,
         Command::Sessions { limit, json } => sessions(limit, json),
         Command::Session { id, action } => session_command(id, action),
+        Command::Export {
+            session,
+            format,
+            out,
+            tab,
+        } => export(session, format, out, tab),
         Command::Config { action } => config(action),
         Command::Doctor { json } => doctor(json),
     }
@@ -449,6 +481,95 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
                 if findings.is_empty() {
                     println!("  No issues detected.");
                 }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+fn export(
+    session_id: i64,
+    format: ExportFormat,
+    out: Option<String>,
+    tab: Option<String>,
+) -> anyhow::Result<ExitCode> {
+    if tab.is_some() && !matches!(format, ExportFormat::Csv) {
+        eprintln!("error: --tab only applies to --format csv");
+        return Ok(ExitCode::FAILURE);
+    }
+    if out.as_deref() == Some("-") && !matches!(format, ExportFormat::Json) {
+        eprintln!("error: --out - (stdout) only supported for --format json");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    db::init_db();
+    let Some(session) = db::get_session(session_id)? else {
+        eprintln!("session {session_id} not found");
+        return Ok(ExitCode::FAILURE);
+    };
+    let pages = db::load_session_pages(session_id)?;
+    if pages.is_empty() {
+        eprintln!("session {session_id} has no stored pages to export");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let base_domain = url::Url::parse(&session.start_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()));
+    let sheets = rustyseo_core::export::build_report_sheets(&pages, base_domain.as_deref());
+
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let target = |ext: &str| -> anyhow::Result<std::path::PathBuf> {
+        match &out {
+            Some(path) => Ok(std::path::PathBuf::from(path)),
+            None => Ok(rustyseo_core::export::exports_dir()?
+                .join(format!("rustyseo_session{session_id}_{timestamp}.{ext}"))),
+        }
+    };
+
+    match format {
+        ExportFormat::Json => {
+            let value = rustyseo_core::export::report_json(&session, &sheets)?;
+            let pretty = serde_json::to_string_pretty(&value)?;
+            if out.as_deref() == Some("-") {
+                println!("{pretty}");
+            } else {
+                let path = target("json")?;
+                std::fs::write(&path, pretty)?;
+                println!("{}", path.display());
+            }
+        }
+        ExportFormat::Xlsx => {
+            let path = target("xlsx")?;
+            rustyseo_core::export::write_xlsx(&sheets, &path)?;
+            println!("{}", path.display());
+        }
+        ExportFormat::Csv => {
+            if let Some(tab) = tab {
+                let sheet = sheets
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&tab))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "sheet not found: {tab} (available: {})",
+                            sheets
+                                .iter()
+                                .map(|s| s.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })?;
+                let path = target("csv")?;
+                rustyseo_core::export::write_csv(sheet, &path)?;
+                println!("{}", path.display());
+            } else {
+                let path = target("zip")?;
+                rustyseo_core::export::write_csv_zip(&sheets, &path)?;
+                println!("{}", path.display());
             }
         }
     }

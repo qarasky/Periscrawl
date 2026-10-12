@@ -2482,6 +2482,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "rust_xlsxwriter",
  "scraper",
  "serde",
  "serde_json",
@@ -2490,6 +2491,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zip 8.6.0",
 ]
 
 [[package]]

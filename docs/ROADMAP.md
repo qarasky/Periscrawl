@@ -39,7 +39,7 @@ Rules:
 - [x] NDJSON event stream (`--json-events`), documented exit codes
 - [x] Session schema + migrations (`sessions` table, per-session pages, `PRAGMA user_version`)
 - [x] `rustyseo sessions`, `rustyseo session <id> show|pages|issues` (human + `--json`)
-- [ ] `rustyseo export <session> --format xlsx|csv|json` (core export extraction)
+- [x] `rustyseo export <session> --format json|xlsx|csv` (core sheet builders + writers; `--tab` / `--out -` for agents)
 - [ ] Enforce robots.txt during crawling; wire the adaptive rate limiter
 - [ ] Precise `--max-pages` semantics (currently overshoots by up to concurrency)
 
