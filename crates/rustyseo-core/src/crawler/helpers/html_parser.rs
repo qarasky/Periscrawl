@@ -122,7 +122,12 @@ pub struct PageData {
     pub javascript: Option<JavascriptInfo>,
     pub cwv_desktop: Option<CwvData>,
     pub cwv_mobile: Option<CwvData>,
+    #[serde(default)]
     pub keywords: Vec<String>,
+    /// True when the page content was produced by headless-Chrome rendering
+    /// (forced JS mode or the smart JS fallback), not the raw HTTP response.
+    #[serde(default)]
+    pub js_rendered: bool,
     pub extraction: Option<ExtractionResult>,
     pub redirect_chain: Vec<crate::models::RedirectHop>,
 }
@@ -405,6 +410,7 @@ pub fn extract_page_elements(document: &Html) -> PageData {
         keywords: extract_keywords(document),
         extraction,
         redirect_chain: vec![],
+        js_rendered: false,
     }
 }
 

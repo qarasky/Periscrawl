@@ -1085,6 +1085,13 @@ fn settings_window(app: &mut RustySeoApp, ctx: &egui::Context) {
                     ui.checkbox(&mut draft.crawler.enable_javascript, "render with Chrome");
                     ui.end_row();
 
+                    ui.label("JS fallback");
+                    ui.checkbox(
+                        &mut draft.crawler.js_fallback,
+                        "render only pages that look client-side",
+                    );
+                    ui.end_row();
+
                     ui.label("Stay on domain");
                     ui.checkbox(&mut draft.crawler.stay_on_domain, "");
                     ui.end_row();

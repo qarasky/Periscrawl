@@ -52,6 +52,10 @@ pub struct CrawlerConfig {
     /// Do not follow links found on noindex pages (meta robots or X-Robots-Tag).
     #[serde(default)]
     pub respect_noindex: bool,
+    /// Render pages with headless Chrome when the raw HTML looks
+    /// client-rendered (framework markers + sparse content).
+    #[serde(default)]
+    pub js_fallback: bool,
 }
 
 fn default_true() -> bool {
@@ -133,6 +137,7 @@ impl Default for AppSettings {
                 respect_crawl_delay: false,
                 respect_nofollow: false,
                 respect_noindex: false,
+                js_fallback: false,
             },
             ui: UiConfig {
                 theme: "Oceanic".to_string(),

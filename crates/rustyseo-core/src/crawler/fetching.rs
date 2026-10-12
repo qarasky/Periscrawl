@@ -13,6 +13,7 @@ pub async fn fetch_and_process(
     user_agents: &[String],
     pagespeed_config: &Option<crate::models::PageSpeedConfig>,
     enable_javascript: bool,
+    js_fallback: bool,
     url: &str,
     base_url: &Url,
     referer: Option<String>,
@@ -21,10 +22,37 @@ pub async fn fetch_and_process(
         if let Some(browser) = browser {
             fetch_js(url, base_url, browser.clone()).await?
         } else {
-            fetch_standard(client, user_agents, url, base_url, referer).await?
+            fetch_standard(client, user_agents, url, base_url, referer).await?.0
         }
     } else {
-        fetch_standard(client, user_agents, url, base_url, referer).await?
+        let (standard, html) =
+            fetch_standard(client, user_agents, url, base_url, referer).await?;
+        if js_fallback && should_render_js(&standard, &html) {
+            if let Some(browser) = browser {
+                tracing::info!(
+                    "[JS-FALLBACK] Rendering {} (client-side framework markers or sparse content)",
+                    standard.url
+                );
+                match fetch_js(url, base_url, browser.clone()).await {
+                    Ok(mut rendered) => {
+                        merge_rendered(&mut rendered, &standard);
+                        rendered
+                    }
+                    Err(err) => {
+                        tracing::warn!("[JS-FALLBACK] Render failed for {}: {}", url, err);
+                        standard
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "[JS-FALLBACK] {} looks client-rendered but no browser is available",
+                    standard.url
+                );
+                standard
+            }
+        } else {
+            standard
+        }
     };
 
     if let Some(config) = pagespeed_config {
@@ -55,7 +83,7 @@ async fn fetch_standard(
     url: &str,
     base_url: &Url,
     referer: Option<String>,
-) -> Result<PageData, String> {
+) -> Result<(PageData, String), String> {
     let mut current_url = url.to_string();
     let mut redirect_chain = Vec::new();
     let mut hops = 0;
@@ -280,7 +308,50 @@ async fn fetch_standard(
         url
     );
 
-    Ok(page_data)
+    Ok((page_data, html_content))
+}
+
+/// Heuristic: does this page look like it needs client-side rendering?
+///
+/// True when the raw HTML carries deliberate client-framework markers
+/// (Next.js, Nuxt, Vue, React, Angular) AND the extracted content is either
+/// thin or the framework's mount point sits empty (a classic SPA shell).
+pub fn should_render_js(page: &PageData, html: &str) -> bool {
+    let lower = html.to_lowercase();
+    let framework_marker = lower.contains("__next_data__")
+        || lower.contains("/_next/")
+        || lower.contains("__nuxt__")
+        || lower.contains("/_nuxt/")
+        || lower.contains("data-reactroot")
+        || lower.contains("data-server-rendered")
+        || lower.contains("data-v-")
+        || lower.contains("<app-root");
+    if !framework_marker {
+        return false;
+    }
+
+    let words = page.word_count.unwrap_or(0);
+    let thin_content = words < 60;
+    let empty_mount = lower.contains("id=\"__next\"></div>")
+        || lower.contains("id=\"__nuxt\"></div>")
+        || lower.contains("id=\"root\"></div>")
+        || lower.contains("id=\"app\"></div>");
+
+    thin_content || empty_mount
+}
+
+/// Keep the HTTP-fetch identity (status, headers, redirects, size) while
+/// swapping in the rendered DOM's content fields.
+fn merge_rendered(rendered: &mut PageData, standard: &PageData) {
+    rendered.id = standard.id;
+    rendered.url = standard.url.clone();
+    rendered.requested_url = standard.requested_url.clone();
+    rendered.status = standard.status.clone();
+    rendered.headers = standard.headers.clone();
+    rendered.redirect_chain = standard.redirect_chain.clone();
+    rendered.size = standard.size;
+    rendered.content_type = standard.content_type.clone();
+    rendered.js_rendered = true;
 }
 
 async fn fetch_js(url: &str, base_url: &Url, browser: Arc<Browser>) -> Result<PageData, String> {
@@ -441,5 +512,60 @@ fn pick_random_user_agent(user_agents: &[String]) -> String {
         "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)".to_string()
     } else {
         user_agents[rand::rng().random_range(0..user_agents.len())].clone()
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::should_render_js;
+    use crate::crawler::helpers::html_parser::{PageData, extract_page_elements};
+
+    fn page_with_words(words: usize) -> PageData {
+        let html = format!("<html><body>{}</body></html>", "word ".repeat(words));
+        let document = scraper::Html::parse_document(&html);
+        extract_page_elements(&document)
+    }
+
+    #[test]
+    fn framework_marker_with_thin_content_triggers() {
+        let page = page_with_words(10);
+        let html = r#"<html><body><div id="__next"></div><script>__NEXT_DATA__</script></body></html>"#;
+        assert!(should_render_js(&page, html));
+    }
+
+    #[test]
+    fn framework_marker_with_rich_content_skips() {
+        // A server-rendered Next.js page still carries the markers; rendering
+        // it again would be wasted work.
+        let page = page_with_words(500);
+        let html = r#"<html><body><div id="__next">lots of server-rendered text</div><script>__NEXT_DATA__</script></body></html>"#;
+        assert!(!should_render_js(&page, html));
+    }
+
+    #[test]
+    fn plain_thin_page_without_framework_skips() {
+        let page = page_with_words(5);
+        let html = "<html><body><p>Short but static page.</p></body></html>";
+        assert!(!should_render_js(&page, html));
+    }
+
+    #[test]
+    fn empty_mount_without_framework_marker_skips() {
+        let page = page_with_words(2);
+        let html = r#"<html><body><div id="root"></div><script src="/main.js"></script></body></html>"#;
+        // No framework marker by name: an empty React mount alone is not
+        // enough to justify a render.
+        assert!(!should_render_js(&page, html));
+        let vue_page = page_with_words(2);
+        let vue_html = r#"<html><body><div id="app"></div><script src="/app.js"></script></body></html>"#;
+        assert!(!should_render_js(&vue_page, vue_html));
+    }
+
+    #[test]
+    fn vue_marker_with_empty_mount_triggers() {
+        let page = page_with_words(2);
+        let html =
+            r#"<html><body><div id="app" data-server-rendered="true"><div id="app"></div></div><script data-v-1234abcd></script></body></html>"#;
+        assert!(should_render_js(&page, html));
     }
 }

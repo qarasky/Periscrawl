@@ -43,6 +43,12 @@ pub struct CrawlEngine {
     respect_nofollow: bool,
     /// Do not follow links discovered on noindex pages.
     respect_noindex: bool,
+    /// Render pages with headless Chrome when the raw HTML looks client-rendered.
+    js_fallback: bool,
+    /// Pages already crawled by a previous (interrupted) run of this session.
+    resume_pages: Option<Arc<Vec<PageData>>>,
+    /// Highest page id already stored for this session (0 for fresh crawls).
+    id_base: usize,
     /// Shared adaptive pacing for outgoing requests (429/5xx aware).
     rate_limiter: Arc<AdaptiveRateLimiter>,
 }
@@ -104,6 +110,9 @@ impl CrawlEngine {
             respect_crawl_delay: false,
             respect_nofollow: false,
             respect_noindex: false,
+            js_fallback: false,
+            resume_pages: None,
+            id_base: 0,
             rate_limiter: Arc::new(AdaptiveRateLimiter::default_polite()),
         }
     }
@@ -187,6 +196,36 @@ impl CrawlEngine {
     /// Do not follow links found on noindex pages (meta robots / X-Robots-Tag).
     pub fn with_noindex(mut self, respect: bool) -> Self {
         self.respect_noindex = respect;
+        self
+    }
+
+    /// Render pages with headless Chrome when the raw HTML looks
+    /// client-rendered (framework markers + sparse content). Launches the
+    /// browser on demand.
+    pub fn with_js_fallback(mut self, enable: bool) -> Self {
+        self.js_fallback = enable;
+        if enable && self.browser.is_none() {
+            let options = LaunchOptions {
+                headless: true,
+                ..Default::default()
+            };
+            match Browser::new(options) {
+                Ok(browser) => self.browser = Some(Arc::new(browser)),
+                Err(err) => {
+                    tracing::error!("Failed to launch browser for JS fallback: {}", err)
+                }
+            }
+        }
+        self
+    }
+
+    /// Continue a previous run of the same session: the stored pages count as
+    /// already crawled and their links seed the crawl frontier.
+    pub fn with_resume_pages(mut self, pages: Vec<PageData>) -> Self {
+        // Continue page ids after the highest stored id so resumed pages can
+        // never overwrite already-persisted rows of the same session.
+        self.id_base = pages.iter().map(|page| page.id).max().unwrap_or(0);
+        self.resume_pages = Some(Arc::new(pages));
         self
     }
 
@@ -311,7 +350,35 @@ impl CrawlEngine {
         let queue_capacity = std::cmp::max(self.max_pages * 10, 200_000);
         let mut queue = crate::crawler::queue::CrawlQueue::with_max_size(Some(queue_capacity));
 
-        if let Some(normalized_start) = crate::crawler::url_normalizer::normalize_url(start_url) {
+        if let Some(resume) = &self.resume_pages {
+            // Resume mode: stored pages count as crawled; their links seed the
+            // frontier so the crawl continues where the previous run stopped.
+            let mut visited = self.visited.lock().await;
+            let mut finished = self.finished_urls.lock().await;
+            let mut seeded = 0usize;
+            for page in resume.iter() {
+                visited.insert(page.url.clone());
+                if !page.requested_url.is_empty() {
+                    visited.insert(page.requested_url.clone());
+                }
+                finished.insert(page.url.clone());
+                for link in &page.anchor_links {
+                    if !visited.contains(&link.href)
+                        && queue.push(link.href.clone(), Some(page.url.clone()))
+                    {
+                        visited.insert(link.href.clone());
+                        seeded += 1;
+                    }
+                }
+            }
+            tracing::info!(
+                "[RESUME] {} stored pages preloaded, {} frontier links queued",
+                resume.len(),
+                seeded
+            );
+        } else if let Some(normalized_start) =
+            crate::crawler::url_normalizer::normalize_url(start_url)
+        {
             queue.push(normalized_start.clone(), None);
             // Mark start URL as seen immediately to prevent re-queuing
             self.visited.lock().await.insert(normalized_start);
@@ -410,6 +477,7 @@ impl CrawlEngine {
                         &engine.user_agents,
                         &engine.pagespeed_config,
                         engine.enable_javascript,
+                        engine.js_fallback,
                         &normalized_url,
                         &base_url_clone,
                         referer,
@@ -453,6 +521,9 @@ impl CrawlEngine {
                         }
                         if data.url != data.requested_url {
                             self.visited.lock().await.insert(data.url.clone());
+                        }
+                        if data.js_rendered {
+                            self.stats.increment_js_render();
                         }
 
                         // Extract new links BEFORE sending result to ensure consistency
@@ -573,7 +644,8 @@ impl CrawlEngine {
                         // Assign a stable, unique sequence id before this page is persisted -
                         // without it every page defaults to id 0 and each DB write via
                         // INSERT OR REPLACE silently clobbers the previous page's row.
-                        data.id = self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        data.id =
+                            self.id_base + self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
                         self.stats.increment_crawled();
                         let _ = tx
                             .send(crate::crawler::CrawlMessage::Page(data.clone()))

@@ -45,9 +45,12 @@ Rules:
 
 ### Phase 2 — CLI v2 (agent surface)
 
-- [ ] Stable JSON schemas for all commands; `--fields` projection
-- [ ] `rustyseo crawl --resume`, incremental re-crawls, crawl diffing
-- [ ] Scheduled-automation ergonomics (quiet mode, non-zero exit on regressions)
+- [x] JSON output everywhere with `--fields` projection; documented exit codes
+- [x] `rustyseo crawl --resume <session>` (continue interrupted crawls; page ids continue safely)
+- [x] Crawl diffing: `rustyseo diff a b`, plus `crawl --compare <baseline>` with
+      regression exit code 6 (removed pages, new 4xx/5xx, newly noindexed)
+- [x] Scheduled-automation ergonomics: `--quiet`, NDJSON events, regression gating
+- [ ] Incremental re-crawls (conditional requests: skip unchanged pages via ETag/Last-Modified)
 
 ### Phase 3 — GUI (egui)
 

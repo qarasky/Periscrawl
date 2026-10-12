@@ -88,6 +88,7 @@ impl App {
                 .with_crawl_delay(settings.crawler.respect_crawl_delay)
                 .with_nofollow(settings.crawler.respect_nofollow)
                 .with_noindex(settings.crawler.respect_noindex)
+                .with_js_fallback(settings.crawler.js_fallback)
                 .with_pagespeed(Some(settings.connectors.pagespeed));
 
             crawler.crawl_concurrently(&url, tx).await;

@@ -5,11 +5,13 @@
 //!   1  fatal error (bad args, engine/session failure)
 //!   2  crawl produced no pages
 //!   3  config key not found
+//!   6  regressions detected (with `crawl --compare` or `diff --fail-on-regressions`)
 //!
 //! With `--json-events`, crawl emits newline-delimited JSON on stdout:
 //!   {"event":"page", ...} and a final {"event":"crawl.end", ...} record.
 //! Every crawl is recorded as a session; query results later with
-//! `rustyseo sessions` and `rustyseo session <id> ...`.
+//! `rustyseo sessions` and `rustyseo session <id> ...`. List-style commands
+//! support `--fields` to project the JSON objects down to the keys you need.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -19,8 +21,9 @@ use serde_json::json;
 
 use rustyseo_core::crawler::{CrawlEngine, CrawlMessage};
 use rustyseo_core::db;
+use rustyseo_core::diff::{self, DiffEntry, DiffKind};
 use rustyseo_core::helpers::issues::{IssueAnalyzer, severity_for};
-use rustyseo_core::models::AppSettings;
+use rustyseo_core::models::{AppSettings, PageSummary};
 
 #[derive(Parser)]
 #[command(name = "rustyseo", version, about = "Crawl and audit websites from the terminal.", long_about = None)]
@@ -44,13 +47,32 @@ enum Command {
         #[arg(long)]
         concurrency: Option<usize>,
 
-        /// Render pages with headless Chrome (needs Chrome/Chromium installed).
+        /// Render every page with headless Chrome (needs Chrome/Chromium).
         #[arg(long)]
         js: bool,
+
+        /// Render only pages that look client-side (framework markers + sparse
+        /// content) instead of every page.
+        #[arg(long)]
+        js_fallback: bool,
+
+        /// Continue an earlier session: its stored pages count as done and
+        /// their links seed the frontier. Requires the database.
+        #[arg(long, value_name = "SESSION")]
+        resume: Option<i64>,
+
+        /// After crawling, diff against this baseline session and exit 6 when
+        /// regressions are found (removed pages, new 4xx/5xx, newly noindexed).
+        #[arg(long, value_name = "SESSION")]
+        compare: Option<i64>,
 
         /// Do not persist pages to the local SQLite database or create a session.
         #[arg(long)]
         no_db: bool,
+
+        /// Only print the final summary (no per-page lines).
+        #[arg(long)]
+        quiet: bool,
 
         /// Emit newline-delimited JSON events instead of human-readable lines.
         #[arg(long)]
@@ -67,6 +89,10 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
 
+        /// Comma-separated fields to keep in JSON output, e.g. `id,status`.
+        #[arg(long)]
+        fields: Option<String>,
+
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -79,6 +105,28 @@ enum Command {
 
         #[command(subcommand)]
         action: SessionAction,
+    },
+
+    /// Compare two sessions (baseline first, current second).
+    Diff {
+        /// Baseline (earlier) session id.
+        baseline: i64,
+
+        /// Current (later) session id.
+        current: i64,
+
+        /// Exit 6 when any regression is present (removed page, new 4xx/5xx,
+        /// newly noindexed) — for scheduled audits.
+        #[arg(long)]
+        fail_on_regressions: bool,
+
+        /// Comma-separated fields to keep per diff entry, e.g. `url,kind`.
+        #[arg(long)]
+        fields: Option<String>,
+
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Export a session as xlsx, CSV (single sheet or zip) or JSON.
@@ -127,6 +175,10 @@ enum SessionAction {
         #[arg(long)]
         limit: Option<usize>,
 
+        /// Comma-separated fields to keep in JSON output.
+        #[arg(long)]
+        fields: Option<String>,
+
         #[arg(long)]
         json: bool,
     },
@@ -135,6 +187,10 @@ enum SessionAction {
         /// Maximum example URLs to include per issue.
         #[arg(long, default_value_t = 5)]
         max_urls: usize,
+
+        /// Comma-separated fields to keep in JSON output.
+        #[arg(long)]
+        fields: Option<String>,
 
         #[arg(long)]
         json: bool,
@@ -191,12 +247,42 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             max_pages,
             concurrency,
             js,
+            js_fallback,
+            resume,
+            compare,
             no_db,
+            quiet,
             json_events,
             name,
-        } => crawl(&url, max_pages, concurrency, js, no_db, json_events, name).await,
-        Command::Sessions { limit, json } => sessions(limit, json),
+        } => {
+            crawl(CrawlArgs {
+                url,
+                max_pages,
+                concurrency,
+                js,
+                js_fallback,
+                resume,
+                compare,
+                no_db,
+                quiet,
+                json_events,
+                name,
+            })
+            .await
+        }
+        Command::Sessions {
+            limit,
+            fields,
+            json,
+        } => sessions(limit, fields.as_deref(), json),
         Command::Session { id, action } => session_command(id, action),
+        Command::Diff {
+            baseline,
+            current,
+            fail_on_regressions,
+            fields,
+            json,
+        } => diff_command(baseline, current, fail_on_regressions, fields.as_deref(), json),
         Command::Export {
             session,
             format,
@@ -208,15 +294,44 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
 }
 
-async fn crawl(
-    url: &str,
+struct CrawlArgs {
+    url: String,
     max_pages: Option<usize>,
     concurrency: Option<usize>,
     js: bool,
+    js_fallback: bool,
+    resume: Option<i64>,
+    compare: Option<i64>,
     no_db: bool,
+    quiet: bool,
     json_events: bool,
     name: Option<String>,
-) -> anyhow::Result<ExitCode> {
+}
+
+async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
+    let CrawlArgs {
+        url,
+        max_pages,
+        concurrency,
+        js,
+        js_fallback,
+        resume,
+        compare,
+        no_db,
+        quiet,
+        json_events,
+        name,
+    } = args;
+
+    if resume.is_some() && no_db {
+        eprintln!("error: --resume requires the database (remove --no-db)");
+        return Ok(ExitCode::FAILURE);
+    }
+    if compare.is_some() && no_db {
+        eprintln!("error: --compare requires the database (remove --no-db)");
+        return Ok(ExitCode::FAILURE);
+    }
+
     // Make sure the app directories/files exist before touching settings or DB.
     rustyseo_core::settings::utils::create::create_settings_file().await;
     rustyseo_core::settings::utils::create::create_recent_crawls_file().await;
@@ -224,6 +339,7 @@ async fn crawl(
 
     let settings = AppSettings::load();
     let effective_max_pages = max_pages.unwrap_or(settings.crawler.max_pages);
+    let use_js_fallback = (js_fallback || settings.crawler.js_fallback) && !js;
 
     let mut engine = CrawlEngine::new()
         .await
@@ -237,12 +353,26 @@ async fn crawl(
     if js {
         engine = engine.with_javascript(true);
     }
+    if use_js_fallback {
+        engine = engine.with_js_fallback(true);
+    }
 
-    let session_id = if no_db {
-        None
+    // Session handling: fresh session, resumed session, or none.
+    let (session_id, base_fetched, base_failed) = if let Some(resume_id) = resume {
+        let Some(session) = db::get_session(resume_id)? else {
+            eprintln!("session {resume_id} not found");
+            return Ok(ExitCode::FAILURE);
+        };
+        let stored_pages = db::load_session_pages(resume_id)?;
+        engine = engine.with_db_persistence(None);
+        engine = engine.with_session(resume_id).with_resume_pages(stored_pages);
+        (Some(resume_id), session.pages_fetched, session.pages_failed)
+    } else if no_db {
+        (None, 0, 0)
     } else {
         engine = engine.with_db_persistence(None);
-        Some(db::create_session(name.as_deref(), url, Some(effective_max_pages))?)
+        let sid = db::create_session(name.as_deref(), &url, Some(effective_max_pages))?;
+        (Some(sid), 0, 0)
     };
 
     if let Some(sid) = session_id {
@@ -251,7 +381,7 @@ async fn crawl(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<CrawlMessage>(1000);
     let task_engine = engine.clone();
-    let task_url = url.to_string();
+    let task_url = url.clone();
     let started = Instant::now();
 
     tokio::spawn(async move {
@@ -279,10 +409,10 @@ async fn crawl(
                             "status": page.status,
                             "url": page.url,
                             "links": links,
-                            "js": js,
+                            "js_rendered": page.js_rendered,
                         })
                     );
-                } else {
+                } else if !quiet {
                     println!("[{}] {} - {} links found", page.status, page.url, links);
                 }
             }
@@ -307,10 +437,17 @@ async fn crawl(
     }
 
     if let Some(sid) = session_id {
-        db::finish_session(sid, "completed", pages, failed)?;
+        db::finish_session(
+            sid,
+            "completed",
+            base_fetched + pages,
+            base_failed + failed,
+        )?;
     }
 
-    let robots_blocked = engine.stats().robots_blocked();
+    let stats = engine.stats();
+    let robots_blocked = stats.robots_blocked();
+    let js_renders = stats.js_renders();
 
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;
@@ -325,6 +462,7 @@ async fn crawl(
                 "pages": pages,
                 "failed": failed,
                 "robots_blocked": robots_blocked,
+                "js_renders": js_renders,
                 "elapsed_ms": elapsed_ms,
                 "db": !no_db,
             })
@@ -338,14 +476,182 @@ async fn crawl(
         } else {
             String::new()
         };
+        let js_note = if js_renders > 0 {
+            format!(", {js_renders} rendered with headless Chrome")
+        } else {
+            String::new()
+        };
         println!(
-            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s{session_note}{robots_note}",
+            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s{session_note}{robots_note}{js_note}",
             elapsed.as_secs_f64()
         );
     }
 
+    // Regression check against a baseline session, for scheduled audits.
+    let mut regressions = 0usize;
+    if let Some(baseline_id) = compare {
+        if let Some(current_id) = session_id {
+            let Some(baseline_session) = db::get_session(baseline_id)? else {
+                eprintln!("baseline session {baseline_id} not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            let Some(current_session) = db::get_session(current_id)? else {
+                eprintln!("session {current_id} not found");
+                return Ok(ExitCode::FAILURE);
+            };
+            let baseline_summaries =
+                session_summaries(baseline_id, &baseline_session.start_url)?;
+            let current_summaries = session_summaries(current_id, &current_session.start_url)?;
+            let (entries, diff_stats) = diff::diff_sessions(&baseline_summaries, &current_summaries);
+            let regression_entries: Vec<&DiffEntry> =
+                entries.iter().filter(|entry| is_regression(entry)).collect();
+            regressions = regression_entries.len();
+
+            if json_events {
+                println!(
+                    "{}",
+                    json!({
+                        "event": "diff",
+                        "baseline": baseline_id,
+                        "added": diff_stats.added,
+                        "removed": diff_stats.removed,
+                        "changed": diff_stats.changed,
+                        "unchanged": diff_stats.unchanged,
+                        "regressions": regressions,
+                    })
+                );
+            } else {
+                println!(
+                    "Diff vs session {baseline_id}: +{} added, −{} removed, ~{} changed, {} unchanged — {} regression(s)",
+                    diff_stats.added,
+                    diff_stats.removed,
+                    diff_stats.changed,
+                    diff_stats.unchanged,
+                    regressions
+                );
+                for entry in regression_entries.iter().take(20) {
+                    println!("  [{}] {}", diff_kind_label(entry.kind), entry.url);
+                }
+            }
+        }
+    }
+
     if pages == 0 {
         return Ok(ExitCode::from(2));
+    }
+    if regressions > 0 {
+        return Ok(ExitCode::from(6));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Diff
+// ---------------------------------------------------------------------------
+
+fn diff_kind_label(kind: DiffKind) -> &'static str {
+    match kind {
+        DiffKind::Added => "added",
+        DiffKind::Removed => "removed",
+        DiffKind::Changed => "changed",
+    }
+}
+
+fn is_regression(entry: &DiffEntry) -> bool {
+    match entry.kind {
+        DiffKind::Removed => true,
+        DiffKind::Added => false,
+        DiffKind::Changed => entry.changes.iter().any(|change| {
+            (change.field == "Status"
+                && (change.new.starts_with('4') || change.new.starts_with('5')))
+                || (change.field == "Indexability" && change.new.to_lowercase().contains("noindex"))
+        }),
+    }
+}
+
+fn session_summaries(session_id: i64, start_url: &str) -> anyhow::Result<Vec<PageSummary>> {
+    let pages = db::load_session_pages(session_id)?;
+    let base_domain = url::Url::parse(start_url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()));
+    Ok(pages
+        .iter()
+        .map(|page| page.summarize(base_domain.as_deref()))
+        .collect())
+}
+
+fn diff_command(
+    baseline: i64,
+    current: i64,
+    fail_on_regressions: bool,
+    fields_raw: Option<&str>,
+    json_output: bool,
+) -> anyhow::Result<ExitCode> {
+    db::init_db();
+    let Some(baseline_session) = db::get_session(baseline)? else {
+        eprintln!("session {baseline} not found");
+        return Ok(ExitCode::FAILURE);
+    };
+    let Some(current_session) = db::get_session(current)? else {
+        eprintln!("session {current} not found");
+        return Ok(ExitCode::FAILURE);
+    };
+
+    let baseline_summaries = session_summaries(baseline, &baseline_session.start_url)?;
+    let current_summaries = session_summaries(current, &current_session.start_url)?;
+    let (entries, stats) = diff::diff_sessions(&baseline_summaries, &current_summaries);
+    let regressions = entries.iter().filter(|entry| is_regression(entry)).count();
+
+    if json_output {
+        let fields = parse_fields(fields_raw);
+        let entries_json: Vec<serde_json::Value> = entries
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "baseline": { "id": baseline, "start_url": baseline_session.start_url },
+                "current": { "id": current, "start_url": current_session.start_url },
+                "stats": stats,
+                "regressions": regressions,
+                "entries": project_array(&entries_json, &fields),
+            }))?
+        );
+    } else {
+        println!(
+            "Diff #{baseline} → #{current} ({})",
+            current_session.start_url
+        );
+        println!(
+            "  +{} added   −{} removed   ~{} changed   {} unchanged   {} regression(s)",
+            stats.added, stats.removed, stats.changed, stats.unchanged, regressions
+        );
+        for entry in entries.iter().take(500) {
+            let changes = entry
+                .changes
+                .iter()
+                .map(|change| format!("{}: {} → {}", change.field, change.old, change.new))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if changes.is_empty() {
+                println!("  [{}] {}", diff_kind_label(entry.kind), entry.url);
+            } else {
+                println!(
+                    "  [{}] {} — {}",
+                    diff_kind_label(entry.kind),
+                    entry.url,
+                    changes
+                );
+            }
+        }
+        if entries.len() > 500 {
+            println!("  … and {} more", entries.len() - 500);
+        }
+    }
+
+    if fail_on_regressions && regressions > 0 {
+        return Ok(ExitCode::from(6));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -364,12 +670,50 @@ fn format_timestamp(raw: &str) -> String {
         .unwrap_or_else(|_| raw.to_string())
 }
 
-fn sessions(limit: usize, json_output: bool) -> anyhow::Result<ExitCode> {
+fn parse_fields(raw: Option<&str>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(|field| field.trim().to_string())
+            .filter(|field| !field.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn project_object(value: &serde_json::Value, fields: &[String]) -> serde_json::Value {
+    if fields.is_empty() {
+        return value.clone();
+    }
+    let mut map = serde_json::Map::new();
+    if let Some(object) = value.as_object() {
+        for field in fields {
+            if let Some(field_value) = object.get(field) {
+                map.insert(field.clone(), field_value.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
+fn project_array(values: &[serde_json::Value], fields: &[String]) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .map(|value| project_object(value, fields))
+        .collect()
+}
+
+fn sessions(limit: usize, fields_raw: Option<&str>, json_output: bool) -> anyhow::Result<ExitCode> {
     db::init_db();
     let rows = db::list_sessions(limit)?;
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        let fields = parse_fields(fields_raw);
+        let values: Vec<serde_json::Value> = rows
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?;
+        println!("{}", serde_json::to_string_pretty(&project_array(&values, &fields))?);
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -417,25 +761,35 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
                     println!("  name      : {name}");
                 }
                 println!("  status    : {}", session.status);
-                println!(
-                    "  started   : {}",
-                    format_timestamp(&session.started_at)
-                );
+                println!("  started   : {}", format_timestamp(&session.started_at));
                 if let Some(finished) = &session.finished_at {
                     println!("  finished  : {}", format_timestamp(finished));
                 }
-                println!("  pages     : {} fetched, {} failed (max_pages={})",
+                println!(
+                    "  pages     : {} fetched, {} failed (max_pages={})",
                     session.pages_fetched,
                     session.pages_failed,
-                    session.max_pages.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
+                    session
+                        .max_pages
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "-".into()),
                 );
                 println!("  stored    : {page_count} page records");
             }
         }
-        SessionAction::Pages { limit, json: json_output } => {
+        SessionAction::Pages {
+            limit,
+            fields,
+            json: json_output,
+        } => {
             let rows = db::session_page_rows(id, limit)?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
+                let fields = parse_fields(fields.as_deref());
+                let values: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<_, _>>()?;
+                println!("{}", serde_json::to_string_pretty(&project_array(&values, &fields))?);
             } else {
                 println!(
                     "{:<4} {:<10} {:>5}  {:<40}  {}",
@@ -450,7 +804,11 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
                 }
             }
         }
-        SessionAction::Issues { max_urls, json: json_output } => {
+        SessionAction::Issues {
+            max_urls,
+            fields,
+            json: json_output,
+        } => {
             let pages = db::load_session_pages(id)?;
             let base_domain = url::Url::parse(&session.start_url)
                 .ok()
@@ -476,13 +834,14 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
             }
 
             if json_output {
+                let fields = parse_fields(fields.as_deref());
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "session_id": id,
                         "pages_analyzed": summaries.len(),
                         "total_findings": total,
-                        "issues": findings,
+                        "issues": project_array(&findings, &fields),
                     }))?
                 );
             } else {
@@ -721,13 +1080,10 @@ fn doctor(json_output: bool) -> anyhow::Result<ExitCode> {
         if let Some(err) = &settings_parse_error {
             println!("              parse error: {err}");
         }
-        println!(
-            "  database  : {}  ({page_count} pages)",
-            db_path.display()
-        );
+        println!("  database  : {}  ({page_count} pages)", db_path.display());
         match &chrome {
             Some(path) => println!("  chrome    : {}", path.display()),
-            None => println!("  chrome    : not found (only needed for --js crawls)"),
+            None => println!("  chrome    : not found (only needed for --js / --js-fallback crawls)"),
         }
     }
 
