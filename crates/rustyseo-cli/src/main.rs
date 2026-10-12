@@ -226,6 +226,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Analyze an nginx/apache access log: bots vs humans, statuses, file
+    /// types, top paths and crawl waste.
+    Logs {
+        /// Path to the access log file.
+        file: String,
+
+        /// Rows kept in each detail list.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -375,7 +390,176 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             max_urls,
             json,
         } => sitemap_command(&url, concurrency, max_urls, json).await,
+        Command::Logs { file, top, json } => logs_command(&file, top, json),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Log analyzer
+// ---------------------------------------------------------------------------
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn percent(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
+}
+
+/// Thousands separators for human-readable counts.
+fn commas(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn short_timestamp(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|ts| ts.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+fn logs_command(file: &str, top: usize, json_output: bool) -> anyhow::Result<ExitCode> {
+    let report = rustyseo_core::loganalyzer::analyze_file(file, top)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Log report: {}", report.file);
+        println!(
+            "  lines {} (parsed {} • malformed {})",
+            commas(report.lines),
+            commas(report.parsed),
+            commas(report.malformed)
+        );
+        if let (Some(first), Some(last)) = (&report.first_timestamp, &report.last_timestamp) {
+            println!(
+                "  range {} → {}",
+                short_timestamp(first),
+                short_timestamp(last)
+            );
+        }
+        println!(
+            "  requests: {} humans • {} bots ({:.0}%) • {} unique IPs • {}",
+            commas(report.human_requests),
+            commas(report.bot_requests),
+            percent(report.bot_requests, report.parsed),
+            commas(report.unique_ips),
+            format_bytes(report.total_bytes)
+        );
+
+        println!("\nStatus:");
+        for (code, count) in &report.status {
+            println!(
+                "  {code}: {:>9} ({:.1}%)",
+                count,
+                percent(*count, report.parsed)
+            );
+        }
+        println!(
+            "  classes: 2xx {:.0}% • 3xx {:.0}% • 4xx {:.0}% • 5xx {:.0}%",
+            percent(report.status_2xx, report.parsed),
+            percent(report.status_3xx, report.parsed),
+            percent(report.status_4xx, report.parsed),
+            percent(report.status_5xx, report.parsed),
+        );
+
+        println!("\nTop bots:");
+        if report.top_bots.is_empty() {
+            println!("  (no bots detected)");
+        }
+        for bot in &report.top_bots {
+            println!(
+                "  {:<24} {:>9} reqs • {:>7} urls • {:>6} 4xx • {:>6} 5xx • {}",
+                bot.bot,
+                bot.requests,
+                bot.unique_urls,
+                bot.client_errors,
+                bot.server_errors,
+                format_bytes(bot.bytes)
+            );
+        }
+
+        println!("\nFile types:");
+        for entry in &report.file_types {
+            println!(
+                "  {:<12} {:>9} reqs • {}",
+                entry.name,
+                entry.requests,
+                format_bytes(entry.bytes)
+            );
+        }
+
+        println!("\nTop paths:");
+        for entry in &report.top_paths {
+            println!(
+                "  {:>9} reqs • {:>8} • {}",
+                entry.requests,
+                format_bytes(entry.bytes),
+                entry.path
+            );
+        }
+
+        println!("\nTop error paths:");
+        if report.error_paths.is_empty() {
+            println!("  (none)");
+        }
+        for entry in &report.error_paths {
+            println!(
+                "  {:>6} 4xx • {:>6} 5xx • {:>9} reqs • {}",
+                entry.client_errors, entry.server_errors, entry.requests, entry.path
+            );
+        }
+
+        println!("\nTop IPs:");
+        for entry in &report.top_ips {
+            println!(
+                "  {:<28} {:>9} reqs • {}",
+                entry.name,
+                entry.requests,
+                format_bytes(entry.bytes)
+            );
+        }
+
+        println!("\nDaily:");
+        for day in &report.daily {
+            println!(
+                "  {}  {:>9} reqs • bots {:.0}% • 4xx {} • 5xx {}",
+                day.date,
+                day.requests,
+                percent(day.bots, day.requests),
+                day.client_errors,
+                day.server_errors
+            );
+        }
+    }
+
+    if report.parsed == 0 {
+        eprintln!("no parseable log lines found in {file}");
+        return Ok(ExitCode::from(2));
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn sitemap_command(

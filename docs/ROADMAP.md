@@ -83,11 +83,13 @@ Rules:
 
 - [x] Sitemap validator (`rustyseo sitemap`): HEAD-checks every sitemap entry with
       redirect-chain awareness; exit 6 when dead entries are found
-- [ ] Log analyzer (Nginx/Apache): bot vs human, status/filetype breakdowns,
-      crawl-budget views
+- [x] Log analyzer (nginx/apache): `rustyseo logs <file>` — bot vs human traffic
+      (search + AI crawlers classified), status/file-type breakdowns, top paths,
+      error paths, top IPs and per-day crawl-waste views; `--json` for agents
+- [ ] GUI surface for the log analyzer (tabs/charts)
+- [ ] PDF reporting (client-facing session reports)
 - [ ] GSC / GA4 / Clarity connectors
 - [ ] Keyword & content tooling (tracking, topics, content planner)
-- [ ] PDF reporting
 
 ## CLI conventions
 

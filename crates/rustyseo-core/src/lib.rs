@@ -11,6 +11,7 @@ pub mod db;
 pub mod diff;
 pub mod export;
 pub mod helpers;
+pub mod loganalyzer;
 pub mod logging;
 pub mod models;
 pub mod server;
