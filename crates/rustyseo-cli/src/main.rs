@@ -18,6 +18,8 @@
 //! `crawl` delegates to it by default so every frontend can watch the same
 //! crawl — `rustyseo watch` streams its events, `rustyseo stop` stops it.
 
+mod mcp;
+
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -202,6 +204,9 @@ enum Command {
 
     /// Run a headless sync server that other commands and the GUI attach to.
     Serve,
+
+    /// Run an MCP (Model Context Protocol) server over stdio for AI agents.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -341,6 +346,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Watch { json, timeout } => watch_command(json, timeout).await,
         Command::Stop => stop_command().await,
         Command::Serve => serve_command().await,
+        Command::Mcp => {
+            mcp::serve().await?;
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

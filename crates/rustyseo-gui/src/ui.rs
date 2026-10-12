@@ -22,7 +22,34 @@ pub fn draw(app: &mut RustySeoApp, ui: &mut egui::Ui) {
     bottom_panel(app, ui);
     detail_panel(app, ui);
     central(app, ui);
+    detail_resize_grip(app, ui);
     settings_window(app, ui.ctx());
+}
+
+/// Explicit left-edge grip for the details pane. egui's built-in right-panel
+/// handle sits at the window edge (and macOS may claim those pixels for
+/// native window resizing), so the dashboard-style "drag the border next to
+/// the table" interaction is implemented here.
+fn detail_resize_grip(app: &mut RustySeoApp, ui: &mut egui::Ui) {
+    let Some(rect) = app.detail_rect else {
+        return;
+    };
+    let grip_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() - 4.0, rect.top()),
+        egui::pos2(rect.left() + 4.0, rect.bottom()),
+    );
+    let response = ui.interact(
+        grip_rect,
+        egui::Id::new("details_resize_grip"),
+        egui::Sense::drag(),
+    );
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    if response.dragged() {
+        app.detail_width =
+            (app.detail_width - response.drag_delta().x).clamp(320.0, 1600.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +463,8 @@ fn sheet_table(
     clicked_target: &mut Option<ClickTarget>,
     new_sort: &mut Option<(usize, bool)>,
 ) {
+    // Rows must be clickable all the way through: text never captures clicks.
+    ui.style_mut().interaction.selectable_labels = false;
     let needle = filter.trim().to_lowercase();
     let mut indices: Vec<usize> = if needle.is_empty() {
         (0..sheet.rows.len()).collect()
@@ -557,6 +586,8 @@ fn click_target_for(sheet_name: &str, row: &[String]) -> Option<ClickTarget> {
 // ---------------------------------------------------------------------------
 
 fn diff_body(app: &mut RustySeoApp, ui: &mut egui::Ui) {
+    // Same click-through guarantee as the data tables.
+    ui.style_mut().interaction.selectable_labels = false;
     ui.horizontal(|ui| {
         ui.heading("Compare with");
         ui.label(RichText::new("(a previous crawl of the same site)").weak());
@@ -694,8 +725,11 @@ fn diff_body(app: &mut RustySeoApp, ui: &mut egui::Ui) {
 
 fn detail_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
     if app.detail.is_none() {
+        app.detail_rect = None;
         return;
     }
+    let max_width = (ui.available_width() - 320.0).max(320.0);
+    let width = app.detail_width.clamp(320.0, max_width);
     let mut close = false;
     let mut next: Option<DetailView> = None;
     {
@@ -706,10 +740,13 @@ fn detail_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
             DetailView::Issue { .. } => "Issue URLs",
             DetailView::DiffEntry { .. } => "Change details",
         };
-        egui::Panel::right("details")
-            .resizable(true)
-            .default_size(540.0)
+        let panel = egui::Panel::right("details")
+            .resizable(false)
+            .exact_size(width)
             .show(ui, |ui| {
+                // Keep the inspector copy-friendly even though global label
+                // selection is disabled for table click-through.
+                ui.style_mut().interaction.selectable_labels = true;
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.heading(title);
@@ -731,6 +768,7 @@ fn detail_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
                         };
                     });
             });
+        app.detail_rect = Some(panel.response.rect);
     }
     if close {
         app.detail = None;

@@ -174,11 +174,20 @@ pub struct RustySeoApp {
     pub settings_open: bool,
     pub settings_draft: AppSettings,
     pub log_path: std::path::PathBuf,
+    /// Width of the details pane, driven by its left-edge drag grip.
+    pub detail_width: f32,
+    /// Last rendered rect of the details pane (for the grip overlay).
+    pub detail_rect: Option<egui::Rect>,
 }
 
 impl RustySeoApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // Data app: text in tables should never steal pointer clicks for
+        // selection — rows must be clickable all the way through. The detail
+        // pane re-enables selection locally where copying matters.
+        cc.egui_ctx
+            .all_styles_mut(|style| style.interaction.selectable_labels = false);
         db::init_db();
 
         let settings = AppSettings::load();
@@ -251,6 +260,8 @@ impl RustySeoApp {
             settings_open: false,
             settings_draft: settings,
             log_path,
+            detail_width: 540.0,
+            detail_rect: None,
         };
         app.refresh_sessions();
         // Testing/automation hook: auto-open a session, e.g.
@@ -471,7 +482,13 @@ impl RustySeoApp {
                 }
             })();
             let message = match result {
-                Ok(path) => format!("Exported: {}", path.display()),
+                Ok(path) => {
+                    // The user asked for the export's folder to pop open.
+                    if let Some(parent) = path.parent() {
+                        open_in_file_manager(parent);
+                    }
+                    format!("Exported: {} (folder opened)", path.display())
+                }
                 Err(err) => format!("Export failed: {err}"),
             };
             let _ = tx.send(message);
@@ -634,4 +651,16 @@ impl eframe::App for RustySeoApp {
         }
         crate::ui::draw(self, ui);
     }
+}
+
+/// Reveal a directory in the OS file manager (Finder / Explorer / xdg).
+fn open_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let command = "open";
+    #[cfg(target_os = "windows")]
+    let command = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let command = "xdg-open";
+
+    let _ = std::process::Command::new(command).arg(path).spawn();
 }
