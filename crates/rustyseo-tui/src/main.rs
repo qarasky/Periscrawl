@@ -14,35 +14,29 @@ use ratatui::{
 use std::{error::Error, io};
 
 // Local modules
-pub mod ai;
 pub mod app;
 pub mod cli;
-pub mod crawler;
-pub mod db;
-pub mod helpers;
-pub mod logging;
 pub mod models;
-pub mod server;
-pub mod settings;
 pub mod ui;
 
-use crate::{app::AppState, cli::Cli, crawler::CrawlEngine, models::App, ui::ui};
+use crate::{app::AppState, cli::Cli, models::App, ui::ui};
+use rustyseo_core::crawler::CrawlEngine;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Logging initialization moved to after TUI setup to capture logs in app
-    let log_rx = logging::init();
+    let log_rx = rustyseo_core::logging::init();
 
     // SPAWN SOME IO TASKS TO NOT SLOW DOWN THE UI
     tokio::task::spawn(async move {
         // CREATE THE RECENT CRAWLS FILE IF IT DOES NOT EXIST
-        settings::utils::create::create_recent_crawls_file().await;
+        rustyseo_core::settings::utils::create::create_recent_crawls_file().await;
 
         // Create the file for the settings
-        settings::utils::create::create_settings_file().await;
+        rustyseo_core::settings::utils::create::create_settings_file().await;
 
         // Init database
-        db::init_db();
+        rustyseo_core::db::init_db();
     });
 
     // Conditionally render the UI based on the args passed
@@ -67,12 +61,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let settings = crate::models::AppSettings::load();
         app.settings = Some(settings);
         app.log_receiver = Some(log_rx);
-        app.bookmarks = db::load_bookmarks();
+        app.bookmarks = rustyseo_core::db::load_bookmarks();
         app.sync_bookmarks_state();
 
         // Initialize the settings file watcher for real-time settings updates
         let (settings_tx, settings_rx) = std::sync::mpsc::channel();
-        let _settings_watcher = settings::watcher::init_settings_watcher(settings_tx);
+        let _settings_watcher = rustyseo_core::settings::watcher::init_settings_watcher(settings_tx);
         app.settings_receiver = Some(settings_rx);
 
         let res = run_app(&mut terminal, &mut app).await;
@@ -656,8 +650,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                                         if app.bookmark_subview == 0 {
                                             // Bookmarks view
                                             if !app.bookmark_input.is_empty() {
-                                                crate::db::add_bookmark(&app.bookmark_input);
-                                                app.bookmarks = crate::db::load_bookmarks();
+                                                rustyseo_core::db::add_bookmark(&app.bookmark_input);
+                                                app.bookmarks = rustyseo_core::db::load_bookmarks();
                                                 app.sync_bookmarks_state();
                                                 app.bookmark_input.clear();
                                                 app.bookmark_cursor = 0;

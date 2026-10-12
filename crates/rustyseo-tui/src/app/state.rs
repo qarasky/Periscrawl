@@ -1,6 +1,6 @@
-use crate::helpers::issues::IssueAnalyzer;
+use rustyseo_core::helpers::issues::IssueAnalyzer;
 use crate::models::{App, AppSettings};
-use crate::settings::utils::read::recent_crawls;
+use rustyseo_core::settings::utils::read::recent_crawls;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -251,7 +251,7 @@ impl Default for App {
             seen_images: std::collections::HashSet::new(),
             page_summaries: Vec::new(),
             selected_page_details: None,
-            db_conn: crate::db::get_connection().ok(),
+            db_conn: rustyseo_core::db::get_connection().ok(),
             css_counts: HashMap::new(),
             js_counts: HashMap::new(),
             image_counts: HashMap::new(),

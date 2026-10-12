@@ -1,4 +1,4 @@
-use crate::helpers::issues::IssueAnalyzer;
+use rustyseo_core::helpers::issues::IssueAnalyzer;
 use crate::models::App;
 
 impl App {
@@ -116,7 +116,7 @@ impl App {
 
             // Discover sitemap URLs
             let sitemap_urls =
-                crate::crawler::sitemap::discover_additional_urls(&start_url, &client).await;
+                rustyseo_core::crawler::sitemap::discover_additional_urls(&start_url, &client).await;
 
             let _ = tx
                 .send(crate::models::RobotsResult {

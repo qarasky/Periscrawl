@@ -34,11 +34,11 @@ impl App {
         let settings = self.settings.as_ref().ok_or("Settings not loaded")?;
 
         let response = match settings.provider.llm.to_lowercase().as_str() {
-            "gemini" => match crate::ai::gemini::ask(&input, settings).await {
+            "gemini" => match rustyseo_core::ai::gemini::ask(&input, settings).await {
                 Ok(resp) => resp,
                 Err(e) => format!("Error: {}", e),
             },
-            "openai" => match crate::ai::openai::ask(&input, settings).await {
+            "openai" => match rustyseo_core::ai::openai::ask(&input, settings).await {
                 Ok(resp) => resp,
                 Err(e) => format!("Error: {}", e),
             },
@@ -183,7 +183,7 @@ impl App {
 
     pub fn show_js_pages_for_url(&mut self, js_url: String) {
         if let Some(ref conn) = self.db_conn {
-            self.js_pages_list = crate::db::get_pages_for_js(conn, &js_url);
+            self.js_pages_list = rustyseo_core::db::get_pages_for_js(conn, &js_url);
             self.js_pages_state.select(Some(0));
             self.show_js_pages_modal = true;
         }
@@ -197,7 +197,7 @@ impl App {
 
     pub fn show_css_pages_for_url(&mut self, css_url: String) {
         if let Some(ref conn) = self.db_conn {
-            self.css_pages_list = crate::db::get_pages_for_css(conn, &css_url);
+            self.css_pages_list = rustyseo_core::db::get_pages_for_css(conn, &css_url);
             self.css_pages_state.select(Some(0));
             self.show_css_pages_modal = true;
         }

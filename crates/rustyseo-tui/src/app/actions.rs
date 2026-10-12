@@ -1,4 +1,4 @@
-use crate::crawler::CrawlMessage;
+use rustyseo_core::crawler::CrawlMessage;
 use crate::models::App;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -50,7 +50,7 @@ impl App {
 
                 // Save to DB and discard large fields
                 if let Some(ref conn) = self.db_conn {
-                    let _ = crate::db::save_page_data_with_conn(conn, &page_data);
+                    let _ = rustyseo_core::db::save_page_data_with_conn(conn, &page_data);
                 }
 
                 // A page can be blocked from indexing via the X-Robots-Tag response
@@ -67,7 +67,7 @@ impl App {
                     .collect();
                 let canonical_count = canonical_tags.len();
                 let canonical_target = canonical_tags.first().and_then(|(_, href, _)| {
-                    let normalized = crate::crawler::url_normalizer::normalize_url(href)
+                    let normalized = rustyseo_core::crawler::url_normalizer::normalize_url(href)
                         .unwrap_or_else(|| href.clone());
                     if normalized == page_data.url {
                         None
@@ -229,7 +229,7 @@ impl App {
 
                 // Populate internal and external links
                 for link in &page_data.outlinks {
-                    let normalized_to = crate::crawler::url_normalizer::normalize_url(&link.href)
+                    let normalized_to = rustyseo_core::crawler::url_normalizer::normalize_url(&link.href)
                         .unwrap_or_else(|| link.href.clone());
                     if normalized_to.starts_with("mailto:") || normalized_to.contains("@") {
                         continue;
@@ -276,7 +276,7 @@ impl App {
                     // TLD or unrelated dotted path segments (e.g. "/v1.2/blog") being
                     // mistaken for a file extension.
                     if let Some(ext) =
-                        crate::crawler::url_normalizer::extract_file_extension(&normalized_to)
+                        rustyseo_core::crawler::url_normalizer::extract_file_extension(&normalized_to)
                     {
                         if self.seen_files.insert(normalized_to.clone()) {
                             let file_entry = crate::models::FileEntry {
@@ -295,7 +295,7 @@ impl App {
                 // O(1) Unique Aggregates Updates
                 if let Some(css_info) = &page_data.css {
                     for css_url in &css_info.css_urls {
-                        let normalized = crate::crawler::url_normalizer::normalize_url(css_url)
+                        let normalized = rustyseo_core::crawler::url_normalizer::normalize_url(css_url)
                             .unwrap_or_else(|| css_url.clone());
                         let count = self.css_counts.entry(normalized.clone()).or_insert(0);
                         *count += 1;
@@ -328,7 +328,7 @@ impl App {
                 if let Some(js_info) = &page_data.javascript {
                     for script in &js_info.scripts {
                         if let Some(js_url) = &script.src {
-                            let normalized = crate::crawler::url_normalizer::normalize_url(js_url)
+                            let normalized = rustyseo_core::crawler::url_normalizer::normalize_url(js_url)
                                 .unwrap_or_else(|| js_url.clone());
                             let count = self.js_counts.entry(normalized.clone()).or_insert(0);
                             *count += 1;
@@ -416,7 +416,7 @@ impl App {
                     .iter()
                     .find(|(_, href, _)| !href.trim().is_empty())
                 {
-                    let normalized_canonical = crate::crawler::url_normalizer::normalize_url(href)
+                    let normalized_canonical = rustyseo_core::crawler::url_normalizer::normalize_url(href)
                         .unwrap_or_else(|| href.clone());
                     if normalized_canonical != page_data.url {
                         self.canonical_map
@@ -544,7 +544,7 @@ impl App {
     }
 
     pub fn open_details(&mut self, id: usize) {
-        if let Some(page_data) = crate::db::load_page_data(id) {
+        if let Some(page_data) = rustyseo_core::db::load_page_data(id) {
             self.selected_page_details = Some(page_data);
             self.show_details = true;
         }
@@ -555,7 +555,7 @@ impl App {
             if selected < self.filtered_table_data.len() {
                 let row_data = &self.filtered_table_data[selected];
                 if let Ok(id) = row_data[0].parse::<usize>() {
-                    if let Some(page_data) = crate::db::load_page_data(id) {
+                    if let Some(page_data) = rustyseo_core::db::load_page_data(id) {
                         self.selected_page_details = Some(page_data);
                     }
                 }

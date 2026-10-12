@@ -12,14 +12,22 @@ fn get_bookmarks_path() -> PathBuf {
 }
 
 pub fn init_db() {
-    // Ensure bookmarks.json exists
+    // Ensure the data directory exists before writing anything into it. This
+    // matters for headless use (fresh machines, CI, isolated HOME dirs) where
+    // no UI has created app directories yet.
     let bookmarks_path = get_bookmarks_path();
+    if let Some(parent) = bookmarks_path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create app data directory");
+    }
     if !bookmarks_path.exists() {
         fs::write(&bookmarks_path, "[]").expect("Failed to create bookmarks.json");
     }
 
     // Initialize SQLite database
     let db_path = get_db_path();
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).expect("Failed to create app data directory");
+    }
     let conn = Connection::open(&db_path).expect("Failed to open database");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS pages (

@@ -39,8 +39,8 @@ impl App {
     pub fn remove_selected_bookmark(&mut self) {
         if !self.bookmarks.is_empty() && self.bookmark_index < self.bookmarks.len() {
             let url = self.bookmarks[self.bookmark_index].clone();
-            crate::db::remove_bookmark(&url);
-            self.bookmarks = crate::db::load_bookmarks();
+            rustyseo_core::db::remove_bookmark(&url);
+            self.bookmarks = rustyseo_core::db::load_bookmarks();
             // Update ListState to match the bookmark_index
             self.sync_bookmarks_state();
         }

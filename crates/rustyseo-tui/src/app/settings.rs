@@ -1,4 +1,4 @@
-use crate::crawler::CrawlEngine;
+use rustyseo_core::crawler::CrawlEngine;
 use crate::models::{App, AppSettings};
 
 impl App {
@@ -135,7 +135,7 @@ impl App {
         ));
 
         self.external_status_receiver = Some(
-            crate::crawler::external_check::spawn_external_link_check(unique_urls, user_agent),
+            rustyseo_core::crawler::external_check::spawn_external_link_check(unique_urls, user_agent),
         );
     }
 

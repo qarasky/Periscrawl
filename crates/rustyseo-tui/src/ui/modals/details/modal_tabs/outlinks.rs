@@ -10,7 +10,7 @@ use ratatui::{
 
 pub fn render(
     f: &mut Frame,
-    anchor_links: &[crate::crawler::helpers::html_parser::AnchorLink],
+    anchor_links: &[rustyseo_core::crawler::helpers::html_parser::AnchorLink],
     url_to_status: &HashMap<String, String>,
     horizontal_scroll: usize,
     table_state: &mut TableState,

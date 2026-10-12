@@ -7,7 +7,6 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::Duration;
 use url::Url;
 
-use crate::app::settings;
 use crate::crawler::fetching::fetch_and_process;
 use crate::crawler::helpers::html_parser::PageData;
 use crate::crawler::helpers::user_agents::user_agents;

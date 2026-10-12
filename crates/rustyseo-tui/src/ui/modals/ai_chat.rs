@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
-use crate::ai::{gemini, openai};
+use rustyseo_core::ai::{gemini, openai};
 use crate::models::App;
 use crate::ui::centered_rect;
 

@@ -105,14 +105,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let base_domain = url::Url::parse(&app.input_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string));
-    let external_outlinks: Vec<crate::crawler::helpers::html_parser::AnchorLink> = page_details
+    let external_outlinks: Vec<rustyseo_core::crawler::helpers::html_parser::AnchorLink> = page_details
         .outlinks
         .iter()
         .filter(|link| {
             let link_domain = url::Url::parse(&link.href)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_string));
-            !crate::crawler::url_normalizer::is_same_domain(
+            !rustyseo_core::crawler::url_normalizer::is_same_domain(
                 link_domain.as_deref(),
                 base_domain.as_deref(),
             )

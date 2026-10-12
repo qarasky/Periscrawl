@@ -142,7 +142,7 @@ pub fn prepare_current_tab_export(app: &App) -> Result<PendingTabExport, String>
 pub fn save_pending_export(pending: PendingTabExport) -> Result<ExportSummary, String> {
     let default_name = pending.default_file_name();
 
-    let path = if crate::helpers::environment::gui_available() {
+    let path = if rustyseo_core::helpers::environment::gui_available() {
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save Export")
             .set_file_name(&default_name)
