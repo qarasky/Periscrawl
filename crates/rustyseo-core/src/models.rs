@@ -1,4 +1,5 @@
 
+use crate::crawler::helpers::html_parser::PageData;
 use serde::{Deserialize, Serialize};
 
 /// Payload sent back from the background robots/sitemaps fetch task.
@@ -328,4 +329,118 @@ pub struct PageSummary {
     pub canonical_count: usize,
     /// True if an HTTPS page loads an image, stylesheet, or script over plain HTTP.
     pub has_mixed_content: bool,
+}
+
+impl PageData {
+    /// Build the compact, analysis-ready summary used by data tables and the
+    /// issue analyzers.
+    ///
+    /// `base_domain` is the crawl host; it decides which anchor links count as
+    /// internal vs external. Pass `None` when unknown — then relative links
+    /// count as internal and absolute URLs as external.
+    pub fn summarize(&self, base_domain: Option<&str>) -> PageSummary {
+        let has_noindex_header = self.headers.iter().any(|h| {
+            let lower = h.to_lowercase();
+            lower.starts_with("x-robots-tag") && lower.contains("noindex")
+        });
+
+        let canonical_tags: Vec<&(String, String, Option<String>)> = self
+            .canonicals
+            .iter()
+            .filter(|(rel, _, _)| rel.eq_ignore_ascii_case("canonical"))
+            .collect();
+        let canonical_count = canonical_tags.len();
+        let canonical_target = canonical_tags.first().and_then(|(_, href, _)| {
+            let normalized = crate::crawler::url_normalizer::normalize_url(href)
+                .unwrap_or_else(|| href.clone());
+            if normalized == self.url {
+                None
+            } else {
+                Some(normalized)
+            }
+        });
+
+        // Browsers block/warn on HTTPS pages loading resources over plain HTTP -
+        // check the three visible-resource kinds (anchor hyperlinks to other
+        // sites don't count; only embedded resources trigger the browser warning).
+        let has_mixed_content = self.url.starts_with("https://")
+            && (self.images.iter().any(|i| i.src.starts_with("http://"))
+                || self
+                    .css
+                    .as_ref()
+                    .is_some_and(|c| c.css_urls.iter().any(|u| u.starts_with("http://")))
+                || self
+                    .javascript
+                    .as_ref()
+                    .is_some_and(|j| j.js_urls.iter().any(|u| u.starts_with("http://"))));
+
+        PageSummary {
+            id: self.id,
+            url: self.url.clone(),
+            title: self.title.clone(),
+            title_len: self.title_len,
+            h1: self.h1.clone(),
+            description: self.description.clone(),
+            description_len: self.description_len,
+            status: self.status.clone(),
+            h1_len: self.h1_len,
+            h1_count: self.headings.iter().filter(|(t, _)| t == "h1").count(),
+            h2_count: self.headings.iter().filter(|(t, _)| t == "h2").count(),
+            h3_count: self.headings.iter().filter(|(t, _)| t == "h3").count(),
+            h4_count: self.headings.iter().filter(|(t, _)| t == "h4").count(),
+            h5_count: self.headings.iter().filter(|(t, _)| t == "h5").count(),
+            h6_count: self.headings.iter().filter(|(t, _)| t == "h6").count(),
+            has_schema: !self.schema.is_empty(),
+            schema_count: self.schema.len(),
+            size: self.size,
+            word_count: self.word_count.unwrap_or(0),
+            internal_link_count: self
+                .anchor_links
+                .iter()
+                .filter(|a| {
+                    !a.href.starts_with("http")
+                        || base_domain.map_or(true, |d| a.href.contains(d))
+                })
+                .count(),
+            external_link_count: self
+                .anchor_links
+                .iter()
+                .filter(|a| {
+                    a.href.starts_with("http")
+                        && base_domain.map_or(false, |d| !a.href.contains(d))
+                })
+                .count(),
+            images_count: self.images.len(),
+            images_missing_alt: self
+                .images
+                .iter()
+                .filter(|i| i.alt.trim().is_empty())
+                .count(),
+            is_canonical: !self.canonicals.is_empty(),
+            has_png_jpg: self.images.iter().any(|i| {
+                i.src.to_lowercase().ends_with(".png")
+                    || i.src.to_lowercase().ends_with(".jpg")
+                    || i.src.to_lowercase().ends_with(".jpeg")
+            }),
+            mobile: self.mobile,
+            indexability: self.indexability.clone(),
+            language: self.language.clone(),
+            cwv_performance_desktop: self
+                .cwv_desktop
+                .as_ref()
+                .and_then(|c| c.performance_score.parse::<f64>().ok()),
+            cwv_performance_mobile: self
+                .cwv_mobile
+                .as_ref()
+                .and_then(|c| c.performance_score.parse::<f64>().ok()),
+            has_generic_anchors: self
+                .anchor_links
+                .iter()
+                .any(|a| a.text.is_empty() || a.text.to_lowercase().contains("here")),
+            has_noindex_header,
+            canonical_target,
+            canonical_count,
+            has_mixed_content,
+        }
+    }
 }

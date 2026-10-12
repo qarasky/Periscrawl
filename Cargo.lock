@@ -2458,12 +2458,14 @@ name = "rustyseo-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "rustyseo-core",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]

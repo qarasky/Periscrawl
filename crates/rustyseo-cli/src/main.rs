@@ -2,12 +2,14 @@
 //!
 //! Exit codes:
 //!   0  success
-//!   1  fatal error (bad args, engine failure)
+//!   1  fatal error (bad args, engine/session failure)
 //!   2  crawl produced no pages
 //!   3  config key not found
 //!
 //! With `--json-events`, crawl emits newline-delimited JSON on stdout:
 //!   {"event":"page", ...} and a final {"event":"crawl.end", ...} record.
+//! Every crawl is recorded as a session; query results later with
+//! `rustyseo sessions` and `rustyseo session <id> ...`.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -15,8 +17,9 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
-use rustyseo_core::crawler::CrawlMessage;
-use rustyseo_core::crawler::CrawlEngine;
+use rustyseo_core::crawler::{CrawlEngine, CrawlMessage};
+use rustyseo_core::db;
+use rustyseo_core::helpers::issues::IssueAnalyzer;
 use rustyseo_core::models::AppSettings;
 
 #[derive(Parser)]
@@ -28,7 +31,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Crawl a website (depth-first over internal links).
+    /// Crawl a website (breadth-first over internal links) and record a session.
     Crawl {
         /// Start URL, e.g. https://example.com
         url: String,
@@ -45,13 +48,37 @@ enum Command {
         #[arg(long)]
         js: bool,
 
-        /// Do not persist pages to the local SQLite database.
+        /// Do not persist pages to the local SQLite database or create a session.
         #[arg(long)]
         no_db: bool,
 
         /// Emit newline-delimited JSON events instead of human-readable lines.
         #[arg(long)]
         json_events: bool,
+
+        /// Human-friendly label for this crawl session.
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// List recorded crawl sessions (newest first).
+    Sessions {
+        /// Maximum number of sessions to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect one crawl session.
+    Session {
+        /// Session id (see `rustyseo sessions`).
+        id: i64,
+
+        #[command(subcommand)]
+        action: SessionAction,
     },
 
     /// Inspect or edit the settings file.
@@ -63,6 +90,33 @@ enum Command {
     /// Check the local environment (settings, database, headless Chrome).
     Doctor {
         /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Session summary (status, counts, timings).
+    Show {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List pages crawled in the session.
+    Pages {
+        /// Maximum number of pages to show.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the SEO issue analyzers over the session's pages.
+    Issues {
+        /// Maximum example URLs to include per issue.
+        #[arg(long, default_value_t = 5)]
+        max_urls: usize,
+
         #[arg(long)]
         json: bool,
     },
@@ -103,7 +157,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             js,
             no_db,
             json_events,
-        } => crawl(&url, max_pages, concurrency, js, no_db, json_events).await,
+            name,
+        } => crawl(&url, max_pages, concurrency, js, no_db, json_events, name).await,
+        Command::Sessions { limit, json } => sessions(limit, json),
+        Command::Session { id, action } => session_command(id, action),
         Command::Config { action } => config(action),
         Command::Doctor { json } => doctor(json),
     }
@@ -116,22 +173,34 @@ async fn crawl(
     js: bool,
     no_db: bool,
     json_events: bool,
+    name: Option<String>,
 ) -> anyhow::Result<ExitCode> {
     // Make sure the app directories/files exist before touching settings or DB.
     rustyseo_core::settings::utils::create::create_settings_file().await;
     rustyseo_core::settings::utils::create::create_recent_crawls_file().await;
-    rustyseo_core::db::init_db();
+    db::init_db();
 
     let settings = AppSettings::load();
+    let effective_max_pages = max_pages.unwrap_or(settings.crawler.max_pages);
 
     let mut engine = CrawlEngine::new()
         .await
-        .with_max_pages(max_pages.unwrap_or(settings.crawler.max_pages))
-        .with_concurrency(concurrency.unwrap_or(settings.crawler.concurrency))
-        .with_javascript(js);
+        .with_max_pages(effective_max_pages)
+        .with_concurrency(concurrency.unwrap_or(settings.crawler.concurrency));
 
-    if !no_db {
+    if js {
+        engine = engine.with_javascript(true);
+    }
+
+    let session_id = if no_db {
+        None
+    } else {
         engine = engine.with_db_persistence(None);
+        Some(db::create_session(name.as_deref(), url, Some(effective_max_pages))?)
+    };
+
+    if let Some(sid) = session_id {
+        engine = engine.with_session(sid);
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<CrawlMessage>(1000);
@@ -191,6 +260,10 @@ async fn crawl(
         }
     }
 
+    if let Some(sid) = session_id {
+        db::finish_session(sid, "completed", pages, failed)?;
+    }
+
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;
 
@@ -200,6 +273,7 @@ async fn crawl(
             json!({
                 "event": "crawl.end",
                 "url": url,
+                "session_id": session_id,
                 "pages": pages,
                 "failed": failed,
                 "elapsed_ms": elapsed_ms,
@@ -207,8 +281,11 @@ async fn crawl(
             })
         );
     } else {
+        let session_note = session_id
+            .map(|sid| format!(" (session {sid})"))
+            .unwrap_or_default();
         println!(
-            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s",
+            "\nCrawled {pages} pages ({failed} non-2xx/3xx) in {:.1}s{session_note}",
             elapsed.as_secs_f64()
         );
     }
@@ -218,6 +295,169 @@ async fn crawl(
     }
     Ok(ExitCode::SUCCESS)
 }
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+fn format_timestamp(raw: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| raw.to_string())
+}
+
+fn sessions(limit: usize, json_output: bool) -> anyhow::Result<ExitCode> {
+    db::init_db();
+    let rows = db::list_sessions(limit)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if rows.is_empty() {
+        println!("No sessions recorded yet. Run `rustyseo crawl <url>` first.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!(
+        "{:<4} {:<18} {:<10} {:>5} {:>6}  {:<16}  {}",
+        "ID", "NAME", "STATUS", "PAGES", "FAILED", "STARTED", "URL"
+    );
+    for row in rows {
+        println!(
+            "{:<4} {:<18} {:<10} {:>5} {:>6}  {:<16}  {}",
+            row.id,
+            row.name.as_deref().unwrap_or("-"),
+            row.status,
+            row.pages_fetched,
+            row.pages_failed,
+            format_timestamp(&row.started_at),
+            row.start_url,
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
+    db::init_db();
+    let Some(session) = db::get_session(id)? else {
+        eprintln!("session {id} not found");
+        return Ok(ExitCode::FAILURE);
+    };
+
+    match action {
+        SessionAction::Show { json: json_output } => {
+            let page_count = db::session_page_count(id)?;
+            if json_output {
+                let mut value = serde_json::to_value(&session)?;
+                value["stored_pages"] = json!(page_count);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("Session {} — {}", session.id, session.start_url);
+                if let Some(name) = &session.name {
+                    println!("  name      : {name}");
+                }
+                println!("  status    : {}", session.status);
+                println!(
+                    "  started   : {}",
+                    format_timestamp(&session.started_at)
+                );
+                if let Some(finished) = &session.finished_at {
+                    println!("  finished  : {}", format_timestamp(finished));
+                }
+                println!("  pages     : {} fetched, {} failed (max_pages={})",
+                    session.pages_fetched,
+                    session.pages_failed,
+                    session.max_pages.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
+                );
+                println!("  stored    : {page_count} page records");
+            }
+        }
+        SessionAction::Pages { limit, json: json_output } => {
+            let rows = db::session_page_rows(id, limit)?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                println!(
+                    "{:<4} {:<10} {:>5}  {:<40}  {}",
+                    "ID", "STATUS", "WORDS", "TITLE", "URL"
+                );
+                for row in rows {
+                    let title: String = row.title.chars().take(40).collect();
+                    println!(
+                        "{:<4} {:<10} {:>5}  {:<40}  {}",
+                        row.page_id, row.status, row.word_count, title, row.url
+                    );
+                }
+            }
+        }
+        SessionAction::Issues { max_urls, json: json_output } => {
+            let pages = db::load_session_pages(id)?;
+            let base_domain = url::Url::parse(&session.start_url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()));
+            let summaries: Vec<_> = pages
+                .iter()
+                .map(|p| p.summarize(base_domain.as_deref()))
+                .collect();
+
+            let mut findings = Vec::new();
+            let mut total = 0usize;
+            for handler in IssueAnalyzer::get_handlers() {
+                let (count, urls) = (handler.process)(&summaries);
+                total += count;
+                if count > 0 {
+                    findings.push(json!({
+                        "issue": handler.name.trim(),
+                        "count": count,
+                        "urls": urls.iter().take(max_urls).collect::<Vec<_>>(),
+                    }));
+                }
+            }
+
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "session_id": id,
+                        "pages_analyzed": summaries.len(),
+                        "total_findings": total,
+                        "issues": findings,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Session {id}: {} issues found across {} pages\n",
+                    total,
+                    summaries.len()
+                );
+                for finding in &findings {
+                    let name = finding["issue"].as_str().unwrap_or("?");
+                    let count = finding["count"].as_u64().unwrap_or(0);
+                    println!("  {name}: {count}");
+                    if let Some(urls) = finding["urls"].as_array() {
+                        for url in urls.iter().take(2) {
+                            println!("      {}", url.as_str().unwrap_or(""));
+                        }
+                    }
+                }
+                if findings.is_empty() {
+                    println!("  No issues detected.");
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 
 fn config(action: ConfigAction) -> anyhow::Result<ExitCode> {
     let path = AppSettings::path();
@@ -283,6 +523,10 @@ fn config(action: ConfigAction) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+// ---------------------------------------------------------------------------
+// Doctor
+// ---------------------------------------------------------------------------
+
 fn doctor(json_output: bool) -> anyhow::Result<ExitCode> {
     let settings_path = AppSettings::path();
     let settings_ok = settings_path.exists();
@@ -291,14 +535,11 @@ fn doctor(json_output: bool) -> anyhow::Result<ExitCode> {
         .and_then(|raw| toml::from_str::<toml::Value>(&raw).err())
         .map(|err| err.to_string());
 
-    rustyseo_core::db::init_db();
-    let db_path = rustyseo_core::db::get_db_path();
+    db::init_db();
+    let db_path = db::get_db_path();
     let db_ok = db_path.exists();
-    let page_count = if db_ok {
-        rustyseo_core::db::get_page_count()
-    } else {
-        0
-    };
+    let page_count = if db_ok { db::get_page_count() } else { 0 };
+    let session_count = db::list_sessions(1).map(|s| s.len()).unwrap_or(0);
 
     let chrome = find_chrome();
     let chrome_ok = chrome.is_some();
@@ -317,6 +558,7 @@ fn doctor(json_output: bool) -> anyhow::Result<ExitCode> {
                     "path": db_path.display().to_string(),
                     "exists": db_ok,
                     "pages": page_count,
+                    "has_sessions": session_count > 0,
                 },
                 "chrome": {
                     "found": chrome_ok,

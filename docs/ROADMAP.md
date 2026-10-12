@@ -37,8 +37,8 @@ Rules:
 - [x] Cargo workspace; extract `rustyseo-core` (crawler, db, settings, issues, ai, logging)
 - [x] `rustyseo` CLI v1: `crawl`, `config get/set/show/path/edit`, `doctor`
 - [x] NDJSON event stream (`--json-events`), documented exit codes
-- [ ] Session schema + migrations (`sessions` table, `pages.session_id`, `PRAGMA user_version`)
-- [ ] `rustyseo sessions list`, `rustyseo session <id> summary|pages|issues`
+- [x] Session schema + migrations (`sessions` table, per-session pages, `PRAGMA user_version`)
+- [x] `rustyseo sessions`, `rustyseo session <id> show|pages|issues` (human + `--json`)
 - [ ] `rustyseo export <session> --format xlsx|csv|json` (core export extraction)
 - [ ] Enforce robots.txt during crawling; wire the adaptive rate limiter
 - [ ] Precise `--max-pages` semantics (currently overshoots by up to concurrency)

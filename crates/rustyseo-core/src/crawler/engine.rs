@@ -31,6 +31,8 @@ pub struct CrawlEngine {
     enable_db_persist: bool,
     pending_pages: Arc<Mutex<Vec<PageData>>>,
     db_batch_size: usize,
+    /// When set, persisted pages are scoped to this crawl session.
+    session_id: Option<i64>,
 }
 
 impl std::fmt::Debug for CrawlEngine {
@@ -85,6 +87,7 @@ impl CrawlEngine {
             enable_db_persist: false,
             pending_pages: Arc::new(Mutex::new(Vec::with_capacity(db_batch_size))),
             db_batch_size,
+            session_id: None,
         }
     }
 
@@ -139,6 +142,13 @@ impl CrawlEngine {
         self
     }
 
+    /// Associate persisted pages with a crawl session (see `db::create_session`).
+    /// Without this, pages are written to the legacy session-0 bucket.
+    pub fn with_session(mut self, session_id: i64) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
     /// Flush pending pages to DB
     async fn flush_pending_pages(&self) {
         if !self.enable_db_persist {
@@ -152,7 +162,7 @@ impl CrawlEngine {
         if let Ok(conn) = db::get_connection() {
             let mut saved = 0;
             for page_data in pages_to_save {
-                if db::save_page_data_with_conn(&conn, &page_data).is_ok() {
+                if db::save_page_for_session(&conn, self.session_id, &page_data).is_ok() {
                     saved += 1;
                 }
             }
@@ -174,7 +184,7 @@ impl CrawlEngine {
             drop(pending);
             if let Ok(conn) = db::get_connection() {
                 for page_data in pages_to_save {
-                    let _ = db::save_page_data_with_conn(&conn, &page_data);
+                    let _ = db::save_page_for_session(&conn, self.session_id, &page_data);
                 }
                 tracing::debug!("Batch flush: {} pages saved to DB", self.db_batch_size);
             }
