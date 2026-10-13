@@ -1241,6 +1241,13 @@ fn settings_window(app: &mut RustySeoApp, ctx: &egui::Context) {
                     );
                     ui.end_row();
 
+                    ui.label("PageSpeed enabled");
+                    ui.checkbox(
+                        &mut draft.connectors.pagespeed.status,
+                        "Collect CWV on crawls (2 API calls/page — slow)",
+                    );
+                    ui.end_row();
+
                     ui.label("Gemini API key");
                     ui.add(
                         egui::TextEdit::singleline(&mut draft.connectors.gemini.api_key)

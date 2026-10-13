@@ -873,7 +873,8 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
         .with_robots(settings.crawler.respect_robots)
         .with_crawl_delay(settings.crawler.respect_crawl_delay)
         .with_nofollow(settings.crawler.respect_nofollow)
-        .with_noindex(settings.crawler.respect_noindex);
+        .with_noindex(settings.crawler.respect_noindex)
+        .with_pagespeed(settings.connectors.pagespeed.active());
 
     if js {
         engine = engine.with_javascript(true);

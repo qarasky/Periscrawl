@@ -91,6 +91,19 @@ pub struct PageSpeedConfig {
     pub status: bool,
 }
 
+impl PageSpeedConfig {
+    /// The config to run with, or `None` when CWV collection is disabled or
+    /// no API key is configured. Crawls call the PageSpeed Insights API twice
+    /// per page (desktop + mobile), so this is opt-in.
+    pub fn active(&self) -> Option<Self> {
+        if self.status && !self.api_key.trim().is_empty() {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchConsoleConfig {
     pub token: String,

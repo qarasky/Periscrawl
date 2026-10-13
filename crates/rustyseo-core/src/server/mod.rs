@@ -228,6 +228,7 @@ impl CrawlService {
                     .with_nofollow(settings.crawler.respect_nofollow)
                     .with_noindex(settings.crawler.respect_noindex)
                     .with_js_fallback(settings.crawler.js_fallback)
+                    .with_pagespeed(settings.connectors.pagespeed.active())
                     .with_session(session_id)
                     .with_db_persistence(None)
                     .with_stop_flag(running_task.stop.clone());
