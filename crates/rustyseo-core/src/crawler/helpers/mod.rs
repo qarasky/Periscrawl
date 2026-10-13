@@ -3,6 +3,7 @@ pub mod extractor;
 pub mod html_parser;
 pub mod image_utils;
 pub mod keywords;
+pub mod psi;
 pub mod rate_limiter;
 pub mod robots;
 pub mod text;

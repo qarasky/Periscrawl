@@ -1244,7 +1244,7 @@ fn settings_window(app: &mut RustySeoApp, ctx: &egui::Context) {
                     ui.label("PageSpeed enabled");
                     ui.checkbox(
                         &mut draft.connectors.pagespeed.status,
-                        "Collect CWV on crawls (2 API calls/page — slow)",
+                        "Collect CWV (sampled: nav pages + one per template)",
                     );
                     ui.end_row();
 

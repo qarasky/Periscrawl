@@ -109,6 +109,10 @@ pub struct PageData {    pub id: usize,
     pub indexability: String,
     pub anchor_links: Vec<AnchorLink>,
     pub outlinks: Vec<AnchorLink>,
+    /// Raw hrefs of links inside header/nav/footer (resolved + normalized by
+    /// the fetch layer). Feeds the PageSpeed sampler's navigation set.
+    #[serde(default)]
+    pub nav_link_targets: Vec<String>,
     pub images: Vec<ImageInfo>,
     pub headings: Vec<(String, String)>,
     pub headers: Vec<String>,
@@ -158,6 +162,7 @@ impl PageData {
             indexability: String::new(),
             anchor_links: Vec::new(),
             outlinks: Vec::new(),
+            nav_link_targets: Vec::new(),
             images: Vec::new(),
             headings: Vec::new(),
             headers: Vec::new(),
@@ -193,6 +198,9 @@ static ROBOTS_SELECTOR: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("meta[name='robots']").unwrap());
 static AFREE_SELECTOR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a[href]").unwrap());
 static IMG_SELECTOR: LazyLock<Selector> = LazyLock::new(|| Selector::parse("img[src]").unwrap());
+/// Sitewide navigation containers (header, nav and footer regions).
+static NAV_CONTAINER_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("header, nav, footer").unwrap());
 static HEADING_SELECTOR: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("h1,h2,h3,h4,h5,h6").unwrap());
 static SCHEMA_SELECTOR: LazyLock<Selector> =
@@ -266,6 +274,21 @@ pub fn extract_page_elements(document: &Html) -> PageData {
             let rel = e.value().attr("rel").unwrap_or("").to_string();
             AnchorLink { href, text, rel }
         })
+        .collect();
+
+    // Links inside header/nav/footer: the sitewide navigation. Used by the
+    // PageSpeed sampler to always test key pages (resolved + normalized by
+    // the fetch layer, deduplicated here in raw form).
+    let mut seen_nav: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let nav_link_targets: Vec<String> = document
+        .select(&NAV_CONTAINER_SELECTOR)
+        .flat_map(|container| {
+            container
+                .select(&AFREE_SELECTOR)
+                .filter_map(|e| e.value().attr("href").map(|href| href.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|href| seen_nav.insert(href.clone()))
         .collect();
 
     // Note: outlinks will be set in fetching.rs with absolutized URLs
@@ -454,6 +477,7 @@ pub fn extract_page_elements(document: &Html) -> PageData {
         indexability,
         anchor_links,
         outlinks: vec![], // Will be set in fetching.rs with absolutized URLs
+        nav_link_targets,
         images,
         headings,
         headers: vec![], // Reserved for future use
@@ -505,4 +529,28 @@ fn extract_meta_content(document: &Html, selector: &Selector) -> String {
         .and_then(|e| e.value().attr("content"))
         .map(|s| s.to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_page_elements;
+
+    #[test]
+    fn nav_links_only_include_header_nav_footer() {
+        let html = r#"
+        <html><body>
+          <header><a href="/logo-home">Home</a></header>
+          <nav><a href="/about">About</a></nav>
+          <main><a href="/article/one">Article</a></main>
+          <footer><a href="/contacts">Contacts</a></footer>
+          <div><a href="/promo">Promo</a></div>
+        </body></html>"#;
+        let document = scraper::Html::parse_document(html);
+        let page = extract_page_elements(&document);
+        let mut nav = page.nav_link_targets.clone();
+        nav.sort();
+        assert_eq!(nav, vec!["/about", "/contacts", "/logo-home"]);
+        // Body links still show up in the regular link lists.
+        assert!(page.anchor_links.iter().any(|link| link.href == "/promo"));
+    }
 }

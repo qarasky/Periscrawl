@@ -51,6 +51,7 @@ pub async fn fetch_and_process(
     browser: &Option<Arc<Browser>>,
     user_agents: &[String],
     pagespeed_config: &Option<crate::models::PageSpeedConfig>,
+    psi_sampler: Option<&crate::crawler::helpers::psi::PsiSampler>,
     enable_javascript: bool,
     js_fallback: bool,
     validators: Option<&FetchValidators>,
@@ -103,9 +104,18 @@ pub async fn fetch_and_process(
 
     if let Some(config) = pagespeed_config {
         if config.status && !config.api_key.is_empty() {
+            if let Some(sampler) = psi_sampler {
+                sampler.add_nav_targets(&page_data.nav_link_targets);
+            }
             let is_html = page_data.content_type.to_lowercase().contains("text/html");
             let is_ok = page_data.status.starts_with('2');
-            if is_html && is_ok {
+            // PageSpeed sampling: navigation pages (once each) and the first
+            // page of every template group. The sampler keeps the whole crawl
+            // to a handful of PSI calls instead of two per page.
+            let sampled = psi_sampler
+                .map(|sampler| sampler.should_sample(&page_data.url))
+                .unwrap_or(true);
+            if is_html && is_ok && sampled {
                 tracing::info!("[CWV] Fetching PageSpeed for {}", url);
                 match fetch_pagespeed_data(client, url, "desktop", &config.api_key).await {
                     Ok(cwv) => page_data.cwv_desktop = Some(cwv),
@@ -340,6 +350,21 @@ async fn fetch_standard(
         })
         .collect();
 
+    // Resolve header/nav/footer links against the final URL and normalize them
+    // the same way crawled page URLs are stored, so the PageSpeed sampler can
+    // match them exactly.
+    let mut seen_nav = std::collections::HashSet::new();
+    page_data.nav_link_targets = page_data
+        .nav_link_targets
+        .iter()
+        .filter_map(|href| final_url.join(href).ok())
+        .map(|abs| {
+            crate::crawler::url_normalizer::normalize_url(abs.as_str())
+                .unwrap_or_else(|| abs.to_string())
+        })
+        .filter(|url| seen_nav.insert(url.clone()))
+        .collect();
+
     // Filter and normalize links to stay on same domain
     let mut seen_urls = std::collections::HashSet::new();
     page_data.anchor_links = page_data
@@ -478,6 +503,19 @@ async fn fetch_js(url: &str, base_url: &Url, browser: Arc<Browser>) -> Result<Pa
                 link.clone()
             }
         })
+        .collect();
+
+    // Resolve header/nav/footer links the same way as crawled page URLs.
+    let mut seen_nav = std::collections::HashSet::new();
+    page_data.nav_link_targets = page_data
+        .nav_link_targets
+        .iter()
+        .filter_map(|href| current_page_url.join(href).ok())
+        .map(|abs| {
+            crate::crawler::url_normalizer::normalize_url(abs.as_str())
+                .unwrap_or_else(|| abs.to_string())
+        })
+        .filter(|url| seen_nav.insert(url.clone()))
         .collect();
 
     // Filter and normalize links...
