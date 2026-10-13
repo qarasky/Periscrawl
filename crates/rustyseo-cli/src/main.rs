@@ -241,6 +241,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Content & keyword analysis for a session: word statistics, thin
+    /// pages, site-wide keywords and target-keyword checks.
+    Content {
+        /// Session id (see `rustyseo sessions`).
+        session: i64,
+
+        /// Target keywords to check, comma-separated.
+        #[arg(long)]
+        keywords: Option<String>,
+
+        /// Rows kept in each detail list.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -392,7 +411,140 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             json,
         } => sitemap_command(&url, concurrency, max_urls, json).await,
         Command::Logs { file, top, json } => logs_command(&file, top, json),
+        Command::Content {
+            session,
+            keywords,
+            top,
+            json,
+        } => content_command(session, keywords.as_deref(), top, json),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Content & keyword analysis
+// ---------------------------------------------------------------------------
+
+fn mark(ok: bool) -> &'static str {
+    if ok { "✓" } else { "✗" }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn content_command(
+    session_id: i64,
+    keywords: Option<&str>,
+    top: usize,
+    json_output: bool,
+) -> anyhow::Result<ExitCode> {
+    db::init_db();
+    let Some(session) = db::get_session(session_id)? else {
+        eprintln!("session {session_id} not found");
+        return Ok(ExitCode::FAILURE);
+    };
+    let pages = db::load_session_pages(session_id)?;
+    if pages.is_empty() {
+        eprintln!("session {session_id} has no stored pages");
+        return Ok(ExitCode::FAILURE);
+    }
+    let targets: Vec<String> = keywords
+        .map(|raw| {
+            raw.split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let report =
+        rustyseo_core::content_audit::build_content_report(session_id, &pages, top, &targets);
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Content & keyword report: {} (session #{})",
+            session.start_url, report.session_id
+        );
+        println!(
+            "  pages {} • {} unique keywords • {} pages without keywords",
+            report.pages_analyzed, report.unique_keywords, report.pages_without_keywords
+        );
+        println!(
+            "  words: total {} • avg {:.0} • median {} • min {} • max {}",
+            report.words.total,
+            report.words.avg,
+            report.words.median,
+            report.words.min,
+            report.words.max
+        );
+        println!("  distribution:");
+        for bucket in &report.buckets {
+            println!("    {:<15} {}", bucket.label, bucket.pages);
+        }
+
+        if !report.thin_pages.is_empty() {
+            println!("\nThin pages (< 300 words, shortest first):");
+            for page in &report.thin_pages {
+                println!("  {:>6} words • {}", page.words, truncate(&page.url, 110));
+            }
+        }
+
+        println!("\nTop keywords:");
+        for keyword in &report.top_keywords {
+            println!(
+                "  {:<26} {:>4} pages • {:>5} uses • avg pos {:.1} • title {} • h1 {} • desc {}",
+                truncate(&keyword.keyword, 26),
+                keyword.pages,
+                keyword.total_uses,
+                keyword.avg_position,
+                keyword.in_titles,
+                keyword.in_h1s,
+                keyword.in_descriptions
+            );
+        }
+
+        if !report.primary_usage.is_empty() {
+            println!("\nPrimary keyword usage (largest pages):");
+            for usage in &report.primary_usage {
+                println!(
+                    "  [{:>4.1}%] {:<22} title {} h1 {} desc {} url {} • {}",
+                    usage.density_percent,
+                    truncate(&usage.keyword, 22),
+                    mark(usage.in_title),
+                    mark(usage.in_h1),
+                    mark(usage.in_description),
+                    mark(usage.in_url),
+                    truncate(&usage.url, 90)
+                );
+            }
+        }
+
+        if !report.targets.is_empty() {
+            println!("\nTarget keyword checks:");
+            for target in &report.targets {
+                println!(
+                    "  {}: {} pages • title {} • h1 {} • desc {} • url {}",
+                    target.keyword,
+                    target.pages_found,
+                    target.in_titles,
+                    target.in_h1s,
+                    target.in_descriptions,
+                    target.in_urls
+                );
+                for url in target.sample_urls.iter().take(3) {
+                    println!("      {}", truncate(url, 110));
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 // ---------------------------------------------------------------------------

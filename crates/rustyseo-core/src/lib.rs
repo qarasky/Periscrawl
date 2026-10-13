@@ -6,6 +6,7 @@
 
 pub mod ai;
 pub mod audit;
+pub mod content_audit;
 pub mod crawler;
 pub mod db;
 pub mod diff;

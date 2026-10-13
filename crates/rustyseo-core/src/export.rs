@@ -277,6 +277,7 @@ pub fn session_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec<Shee
         overview,
         cwv_sheet(pages),
         content_sheet(pages),
+        keywords_sheet(pages),
         internal,
         external,
         redirects,
@@ -376,6 +377,35 @@ pub fn content_sheet(pages: &[PageData]) -> Sheet {
             summary.word_count.to_string(),
             page.size.to_string(),
             keywords.join(", "),
+        ]);
+    }
+    sheet
+}
+
+/// Site-wide keyword overview as a sheet (top 200 terms by spread).
+pub fn keywords_sheet(pages: &[PageData]) -> Sheet {
+    let stats = crate::content_audit::keyword_overview(pages, 200);
+    let mut sheet = Sheet::new(
+        "Keywords",
+        &[
+            "Keyword",
+            "Pages",
+            "Total Uses",
+            "Avg Position",
+            "In Titles",
+            "In H1s",
+            "In Descriptions",
+        ],
+    );
+    for stat in stats {
+        sheet.push(vec![
+            stat.keyword,
+            stat.pages.to_string(),
+            stat.total_uses.to_string(),
+            format!("{:.1}", stat.avg_position),
+            stat.in_titles.to_string(),
+            stat.in_h1s.to_string(),
+            stat.in_descriptions.to_string(),
         ]);
     }
     sheet

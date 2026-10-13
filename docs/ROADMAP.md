@@ -89,8 +89,11 @@ Rules:
 - [ ] GUI surface for the log analyzer (tabs/charts)
 - [x] PDF reporting: `rustyseo export <session> --format pdf` + GUI "Export PDF" —
       styled client-facing report (summary tiles, issues by severity, broken pages)
+- [x] Keyword & content tooling: `rustyseo content <session> [--keywords a,b]`
+      (word stats, thin pages, site-wide keywords, target checks) + Keywords sheet
 - [ ] GSC / GA4 / Clarity connectors
-- [ ] Keyword & content tooling (tracking, topics, content planner)
+- [x] Packaged app bundles: macOS `.app` (generated icon, ad-hoc signed, zip),
+      Linux tar.gz + install.sh + .desktop, Windows zip — via `scripts/package-*`
 
 ## CLI conventions
 
