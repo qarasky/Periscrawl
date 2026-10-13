@@ -321,6 +321,9 @@ pub struct PageSummary {
     pub description: String,
     pub description_len: usize,
     pub status: String,
+    /// Response content type, e.g. "text/html; charset=utf-8". Content
+    /// analyzers only consider pages whose type is HTML.
+    pub content_type: String,
     pub h1_len: usize,
     pub h1_count: usize,
     pub h2_count: usize,
@@ -403,12 +406,15 @@ impl PageData {
             id: self.id,
             url: self.url.clone(),
             title: self.title.clone(),
-            title_len: self.title_len,
+            // Lengths are recomputed from the text as character counts so even
+            // sessions stored before the byte-length fix report true lengths.
+            title_len: self.title.chars().count(),
             h1: self.h1.clone(),
             description: self.description.clone(),
-            description_len: self.description_len,
+            description_len: self.description.chars().count(),
             status: self.status.clone(),
-            h1_len: self.h1_len,
+            content_type: self.content_type.clone(),
+            h1_len: self.h1.chars().count(),
             h1_count: self.headings.iter().filter(|(t, _)| t == "h1").count(),
             h2_count: self.headings.iter().filter(|(t, _)| t == "h2").count(),
             h3_count: self.headings.iter().filter(|(t, _)| t == "h3").count(),
@@ -439,7 +445,13 @@ impl PageData {
             images_missing_alt: self
                 .images
                 .iter()
-                .filter(|i| i.alt.trim().is_empty())
+                .filter(|image| match image.has_alt {
+                    // Precise signal: only a missing attribute counts.
+                    Some(true) => false,
+                    Some(false) => true,
+                    // Legacy records: fall back to the old empty-string heuristic.
+                    None => image.alt.trim().is_empty(),
+                })
                 .count(),
             is_canonical: !self.canonicals.is_empty(),
             has_png_jpg: self.images.iter().any(|i| {
@@ -448,7 +460,11 @@ impl PageData {
                     || i.src.to_lowercase().ends_with(".jpeg")
             }),
             mobile: self.mobile,
-            indexability: self.indexability.clone(),
+            indexability: if self.indexability.trim().is_empty() {
+                "indexable (no meta robots)".to_string()
+            } else {
+                self.indexability.clone()
+            },
             language: self.language.clone(),
             cwv_performance_desktop: self
                 .cwv_desktop

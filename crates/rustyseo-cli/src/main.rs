@@ -30,7 +30,7 @@ use serde_json::json;
 use rustyseo_core::crawler::{CrawlEngine, CrawlMessage};
 use rustyseo_core::db;
 use rustyseo_core::diff::{self, DiffEntry, DiffKind};
-use rustyseo_core::helpers::issues::{IssueAnalyzer, severity_for};
+use rustyseo_core::helpers::issues::IssueAnalyzer;
 use rustyseo_core::models::{AppSettings, PageSummary};
 use rustyseo_core::server::SyncClient;
 
@@ -1652,52 +1652,48 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
             let base_domain = url::Url::parse(&session.start_url)
                 .ok()
                 .and_then(|u| u.host_str().map(|h| h.to_string()));
-            let summaries: Vec<_> = pages
-                .iter()
-                .map(|p| p.summarize(base_domain.as_deref()))
-                .collect();
-
-            let mut findings = Vec::new();
-            let mut total = 0usize;
-            for handler in IssueAnalyzer::get_handlers() {
-                let (count, urls) = (handler.process)(&summaries);
-                total += count;
-                if count > 0 {
-                    findings.push(json!({
-                        "issue": handler.name.trim(),
-                        "severity": severity_for(handler.name).as_str(),
-                        "count": count,
-                        "urls": urls.iter().take(max_urls).collect::<Vec<_>>(),
-                    }));
-                }
-            }
+            // Shared session analyzer: consistent gating (content issues only on
+            // 2xx HTML pages) plus the whole-crawl link-graph issues.
+            let findings = IssueAnalyzer::analyze_session(&pages, base_domain.as_deref());
+            let total: usize = findings.iter().map(|finding| finding.count).sum();
 
             if json_output {
                 let fields = parse_fields(fields.as_deref());
+                let values: Vec<serde_json::Value> = findings
+                    .iter()
+                    .map(|finding| {
+                        json!({
+                            "issue": finding.name,
+                            "severity": finding.severity.as_str(),
+                            "count": finding.count,
+                            "urls": finding.urls.iter().take(max_urls).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "session_id": id,
-                        "pages_analyzed": summaries.len(),
+                        "pages_analyzed": pages.len(),
                         "total_findings": total,
-                        "issues": project_array(&findings, &fields),
+                        "issues": project_array(&values, &fields),
                     }))?
                 );
             } else {
                 println!(
                     "Session {id}: {} issues found across {} pages\n",
                     total,
-                    summaries.len()
+                    pages.len()
                 );
                 for finding in &findings {
-                    let name = finding["issue"].as_str().unwrap_or("?");
-                    let severity = finding["severity"].as_str().unwrap_or("notice");
-                    let count = finding["count"].as_u64().unwrap_or(0);
-                    println!("  [{severity}] {name}: {count}");
-                    if let Some(urls) = finding["urls"].as_array() {
-                        for url in urls.iter().take(2) {
-                            println!("      {}", url.as_str().unwrap_or(""));
-                        }
+                    println!(
+                        "  [{}] {}: {}",
+                        finding.severity.as_str(),
+                        finding.name,
+                        finding.count
+                    );
+                    for url in finding.urls.iter().take(2) {
+                        println!("      {url}");
                     }
                 }
                 if findings.is_empty() {

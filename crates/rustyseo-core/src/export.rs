@@ -14,7 +14,7 @@ use directories::ProjectDirs;
 use rust_xlsxwriter::{Format, Workbook};
 
 use crate::crawler::PageData;
-use crate::helpers::issues::{IssueAnalyzer, severity_for};
+use crate::helpers::issues::IssueAnalyzer;
 
 /// One exportable table. Column order in `header` matches every row.
 #[derive(Debug, Clone)]
@@ -413,20 +413,17 @@ pub fn keywords_sheet(pages: &[PageData]) -> Sheet {
 
 /// The issue audit as a sheet: severity, issue, count, sample URLs.
 pub fn issues_sheet(pages: &[PageData], base_domain: Option<&str>) -> Sheet {
-    let summaries: Vec<_> = pages.iter().map(|p| p.summarize(base_domain)).collect();
+    let findings = IssueAnalyzer::analyze_session(pages, base_domain);
 
     let mut sheet = Sheet::new("Issues", &["Severity", "Issue", "Count", "Sample URLs"]);
-    for handler in IssueAnalyzer::get_handlers() {
-        let (count, urls) = (handler.process)(&summaries);
-        if count > 0 {
-            let sample: Vec<String> = urls.iter().take(10).cloned().collect();
-            sheet.push(vec![
-                severity_for(handler.name).as_str().to_string(),
-                handler.name.trim().to_string(),
-                count.to_string(),
-                sample.join(" | "),
-            ]);
-        }
+    for finding in findings {
+        let sample: Vec<String> = finding.urls.iter().take(10).cloned().collect();
+        sheet.push(vec![
+            finding.severity.as_str().to_string(),
+            finding.name,
+            finding.count.to_string(),
+            sample.join(" | "),
+        ]);
     }
     sheet
 }

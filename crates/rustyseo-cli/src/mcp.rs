@@ -9,8 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use rustyseo_core::db;
 use rustyseo_core::export;
-use rustyseo_core::helpers::issues::{IssueAnalyzer, severity_for};
-use rustyseo_core::models::PageSummary;
+use rustyseo_core::helpers::issues::IssueAnalyzer;
 use rustyseo_core::report;
 use rustyseo_core::server::SyncClient;
 
@@ -234,35 +233,26 @@ async fn call_tool(name: &str, args: &Value) -> Result<String, String> {
             let base_domain = url::Url::parse(&session.start_url)
                 .ok()
                 .and_then(|url| url.host_str().map(|host| host.to_string()));
-            let summaries: Vec<PageSummary> = pages
-                .iter()
-                .map(|page| page.summarize(base_domain.as_deref()))
-                .collect();
-
+            let findings = IssueAnalyzer::analyze_session(&pages, base_domain.as_deref());
             let mut issues = Vec::new();
             let mut total = 0usize;
-            for handler in IssueAnalyzer::get_handlers() {
-                let severity = severity_for(handler.name).as_str();
+            for finding in &findings {
                 if let Some(filter) = &severity_filter {
-                    if severity != filter {
+                    if finding.severity.as_str() != filter {
                         continue;
                     }
                 }
-                let (count, urls) = (handler.process)(&summaries);
-                if count == 0 {
-                    continue;
-                }
-                total += count;
+                total += finding.count;
                 issues.push(json!({
-                    "issue": handler.name.trim(),
-                    "severity": severity,
-                    "count": count,
-                    "urls": urls.iter().take(max_urls).collect::<Vec<_>>(),
+                    "issue": finding.name,
+                    "severity": finding.severity.as_str(),
+                    "count": finding.count,
+                    "urls": finding.urls.iter().take(max_urls).collect::<Vec<_>>(),
                 }));
             }
             serde_json::to_string_pretty(&json!({
                 "session_id": session_id,
-                "pages_analyzed": summaries.len(),
+                "pages_analyzed": pages.len(),
                 "total_findings": total,
                 "issues": issues,
             }))

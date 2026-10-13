@@ -1,12 +1,7 @@
+use crate::crawler::helpers::text::body_text;
 use scraper::Html;
 
+/// Count words in the page's visible text (script/style excluded).
 pub fn get_words(html: &Html) -> usize {
-    let text = html
-        .root_element()
-        .text()
-        .collect::<String>()
-        .replace("\n", " ")
-        .replace("\t", " ");
-
-    text.split_whitespace().count()
+    body_text(html).split_whitespace().count()
 }

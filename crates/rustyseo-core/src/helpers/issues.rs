@@ -49,10 +49,27 @@ pub fn severity_for(issue_name: &str) -> IssueSeverity {
         | "Missing Alt Text"
         | "Thin Content (< 300 words)"
         | "Large HTML Pages"
-        | "Low Internal Link Count" => IssueSeverity::Warning,
+        | "Low Internal Link Count"
+        | "Orphan Pages"
+        | "Internal Nofollow Links"
+        | "Canonical Points to Broken Page"
+        | "Redirect Chains" => IssueSeverity::Warning,
+
+        "Broken Internal Links" | "Redirects to Error" => IssueSeverity::Critical,
 
         _ => IssueSeverity::Notice,
     }
+}
+
+/// One aggregated issue with the URLs that triggered it. Produced by
+/// [`IssueAnalyzer::analyze_session`], the single entry point every frontend
+/// (CLI, GUI, exports, PDF, MCP) uses so gating stays consistent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IssueFinding {
+    pub name: String,
+    pub severity: IssueSeverity,
+    pub count: usize,
+    pub urls: Vec<String>,
 }
 
 // Simple cache for robots.txt results to avoid repeated network requests
@@ -610,12 +627,13 @@ impl IssueAnalyzer {
         (urls.len(), urls)
     }
 
-    /// URLs containing uppercase characters - can cause duplicate-content issues
-    /// on case-sensitive servers and looks inconsistent in the SERP.
+    /// URLs containing uppercase characters in the *path* — can cause
+    /// duplicate-content issues on case-sensitive servers. Percent-escape hex
+    /// digits (`%C2%AB`) and query strings (`?mediaTab=`) are excluded.
     pub fn analyse_uppercase_urls(page_data: &[PageSummary]) -> (usize, Vec<String>) {
         let mut urls = Vec::new();
         for page in page_data {
-            if page.url.chars().any(|c| c.is_uppercase()) {
+            if url_path_has_uppercase(&page.url) {
                 urls.push(page.url.clone());
             }
         }
@@ -1057,5 +1075,247 @@ impl IssueAnalyzer {
         }
 
         blocked_urls
+    }
+}
+
+/// Uppercase letters in the URL *path*, ignoring percent-escape hex digits
+/// (`%C2%AB`) and query/fragment content (camelCase params are fine).
+fn url_path_has_uppercase(url: &str) -> bool {
+    let path = match url::Url::parse(url) {
+        Ok(parsed) => parsed.path().to_string(),
+        Err(_) => {
+            let without_scheme = url
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(url);
+            let path_part = match without_scheme.split_once('/') {
+                Some((_, rest)) => format!("/{rest}"),
+                None => "/".to_string(),
+            };
+            path_part
+                .split(['?', '#'])
+                .next()
+                .unwrap_or("/")
+                .to_string()
+        }
+    };
+
+    // Drop percent-escape triplets before the case check.
+    let mut cleaned = String::with_capacity(path.len());
+    let mut chars = path.chars();
+    while let Some(character) = chars.next() {
+        if character == '%' {
+            let _ = chars.next();
+            let _ = chars.next();
+        } else {
+            cleaned.push(character);
+        }
+    }
+    cleaned.chars().any(|character| character.is_uppercase())
+}
+
+impl IssueAnalyzer {
+    /// Issues that only make sense for successfully fetched HTML pages.
+    /// Everything except the status-code analyzers is content-gated, so error
+    /// pages, redirects and binary files never leak into content findings.
+    pub fn is_content_issue(name: &str) -> bool {
+        !matches!(name.trim(), "404 Errors" | "3XX Errors" | "5XX Errors")
+    }
+
+    /// Pages a content analyzer should look at: successful fetch + HTML body.
+    /// Empty content types are treated as HTML (legacy records, local tests).
+    pub fn is_analyzable_page(page: &PageSummary) -> bool {
+        page.status.starts_with('2')
+            && (page.content_type.is_empty()
+                || page.content_type.to_lowercase().contains("html"))
+    }
+
+    /// Run the page-based analyzers with consistent gating plus the
+    /// whole-crawl link-graph analyzers. Findings with count == 0 are dropped.
+    pub fn run_all_issues(
+        summaries: &[PageSummary],
+        internal_links: &[InternalLink],
+        redirects: &[RedirectEntry],
+        url_to_status: &HashMap<String, String>,
+        start_url: &str,
+    ) -> Vec<IssueFinding> {
+        // The content-gated subset is built once (cheap relative to per-page
+        // analyzer work) and shared by every content analyzer.
+        let content_pages: Vec<PageSummary> = summaries
+            .iter()
+            .filter(|page| Self::is_analyzable_page(page))
+            .cloned()
+            .collect();
+
+        let mut findings: Vec<IssueFinding> = Vec::new();
+        for handler in Self::get_handlers() {
+            let input: &[PageSummary] = if Self::is_content_issue(handler.name) {
+                &content_pages
+            } else {
+                summaries
+            };
+            let (count, urls) = (handler.process)(input);
+            if count > 0 {
+                findings.push(IssueFinding {
+                    name: handler.name.trim().to_string(),
+                    severity: severity_for(handler.name),
+                    count,
+                    urls,
+                });
+            }
+        }
+
+        // Whole-crawl link-graph analyzers (need every page's links/statuses).
+        let mut push = |name: &str, (count, urls): (usize, Vec<String>)| {
+            if count > 0 {
+                findings.push(IssueFinding {
+                    name: name.to_string(),
+                    severity: severity_for(name),
+                    count,
+                    urls,
+                });
+            }
+        };
+        push(
+            "Broken Internal Links",
+            Self::analyse_broken_internal_links(internal_links, url_to_status),
+        );
+        push(
+            "Internal Nofollow Links",
+            Self::analyse_internal_nofollow_links(internal_links),
+        );
+        push(
+            "Orphan Pages",
+            Self::analyse_orphan_pages(summaries, internal_links, start_url),
+        );
+        push(
+            "Canonical Points to Broken Page",
+            Self::analyse_canonical_points_to_broken(summaries, url_to_status),
+        );
+        push("Redirect Chains", Self::analyse_redirect_chains(redirects));
+        push(
+            "Redirects to Error",
+            Self::analyse_redirects_to_error(redirects),
+        );
+
+        findings
+    }
+
+    /// Analyze a whole session from its stored pages: builds summaries,
+    /// internal links, redirect entries and a url→status map, then runs every
+    /// analyzer with consistent gating. This is the single entry point used by
+    /// the CLI, GUI, exports, PDF reports and the MCP server.
+    pub fn analyze_session(
+        pages: &[crate::crawler::PageData],
+        base_domain: Option<&str>,
+    ) -> Vec<IssueFinding> {
+        let summaries: Vec<PageSummary> = pages
+            .iter()
+            .map(|page| page.summarize(base_domain))
+            .collect();
+
+        let mut url_to_status: HashMap<String, String> = HashMap::with_capacity(pages.len() * 2);
+        for page in pages {
+            url_to_status.insert(page.url.clone(), page.status.clone());
+            if !page.requested_url.is_empty() {
+                url_to_status.insert(page.requested_url.clone(), page.status.clone());
+            }
+        }
+
+        let mut internal_links: Vec<InternalLink> = Vec::new();
+        let mut link_id = 0usize;
+        for page in pages {
+            for link in &page.anchor_links {
+                link_id += 1;
+                internal_links.push(InternalLink {
+                    id: link_id,
+                    source: page.url.clone(),
+                    destination: link.href.clone(),
+                    anchor: link.text.clone(),
+                    rel: link.rel.clone(),
+                });
+            }
+        }
+
+        let redirects: Vec<RedirectEntry> = pages
+            .iter()
+            .filter(|page| !page.redirect_chain.is_empty())
+            .enumerate()
+            .map(|(index, page)| RedirectEntry {
+                id: index + 1,
+                initial_url: if page.requested_url.is_empty() {
+                    page.url.clone()
+                } else {
+                    page.requested_url.clone()
+                },
+                // Final status of the chain — "Redirects to Error" compares
+                // this against 2xx to catch chains that land on 4xx/5xx.
+                status_code: page
+                    .status
+                    .get(..3)
+                    .and_then(|code| code.parse::<u16>().ok())
+                    .unwrap_or(0),
+                chain: page.redirect_chain.clone(),
+            })
+            .collect();
+
+        // Pages arrive ordered by id, so the first entry is the crawl seed.
+        let start_url = pages.first().map(|page| page.url.as_str()).unwrap_or("");
+
+        Self::run_all_issues(
+            &summaries,
+            &internal_links,
+            &redirects,
+            &url_to_status,
+            start_url,
+        )
+    }
+}
+
+#[cfg(test)]
+mod gating_tests {
+    use super::{IssueAnalyzer, url_path_has_uppercase};
+    use crate::crawler::helpers::html_parser::{PageData, extract_page_elements};
+
+    fn page(status: &str, content_type: &str) -> PageData {
+        let html = "<html><head><title>t</title></head><body><h1>h</h1><p>words here</p></body></html>";
+        let document = scraper::Html::parse_document(html);
+        let mut page = extract_page_elements(&document);
+        page.status = status.to_string();
+        page.content_type = content_type.to_string();
+        page
+    }
+
+    #[test]
+    fn uppercase_check_ignores_percent_escapes_and_query() {
+        assert!(!url_path_has_uppercase(
+            "https://example.com/news/%C2%ABbaiterek%C2%BB-holdingi"
+        ));
+        assert!(!url_path_has_uppercase(
+            "https://example.com/en/for-media?mediaTab=materials"
+        ));
+        assert!(url_path_has_uppercase("https://example.com/Projects/Case"));
+        assert!(!url_path_has_uppercase("https://example.com/projects/case"));
+    }
+
+    #[test]
+    fn content_gating_only_accepts_ok_html_pages() {
+        let ok_html = page("200 OK", "text/html; charset=utf-8").summarize(None);
+        let not_found = page("404 Not Found", "text/html").summarize(None);
+        let docx = page("200 OK", "application/vnd.openxmlformats-officedocument").summarize(None);
+        let legacy = page("200 OK", "").summarize(None);
+
+        assert!(IssueAnalyzer::is_analyzable_page(&ok_html));
+        assert!(!IssueAnalyzer::is_analyzable_page(&not_found));
+        assert!(!IssueAnalyzer::is_analyzable_page(&docx));
+        assert!(IssueAnalyzer::is_analyzable_page(&legacy));
+    }
+
+    #[test]
+    fn status_issues_are_not_content_gated() {
+        assert!(!IssueAnalyzer::is_content_issue("404 Errors"));
+        assert!(!IssueAnalyzer::is_content_issue(" 5XX Errors "));
+        assert!(IssueAnalyzer::is_content_issue("Missing H1"));
+        assert!(IssueAnalyzer::is_content_issue("Broken Internal Links"));
     }
 }

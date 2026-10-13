@@ -186,6 +186,7 @@ mod tests {
 
     fn page(url: &str, status: &str) -> PageSummary {
         PageSummary {
+            content_type: "text/html".to_string(),
             id: 0,
             url: url.to_string(),
             title: String::new(),

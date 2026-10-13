@@ -15,8 +15,9 @@ GLYPH = (245, 248, 255)    # near-white
 ACCENT = (90, 150, 255)    # RustySEO blue
 
 
-def smooth(edge0: float, edge1: float, x: float) -> float:
-    t = min(max((x - edge0) / (edge1 - edge0), 0.0), 1.0)
+def smooth(edge_out: float, edge_in: float, x: float) -> float:
+    """Coverage for a signed distance: 1 deep inside (< edge_in), 0 outside (> edge_out)."""
+    t = min(max((x - edge_in) / (edge_out - edge_in), 0.0), 1.0)
     return 1.0 - t * t * (3.0 - 2.0 * t)
 
 

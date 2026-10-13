@@ -89,8 +89,7 @@ impl Default for CwvData {
 /// extracted from an HTML document, including metadata, content metrics,
 /// links, images, and structured data.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PageData {
-    pub id: usize,
+pub struct PageData {    pub id: usize,
     pub url: String,
     /// The literal URL that was queued/requested, before any redirects were followed.
     /// Differs from `url` only when the request resulted in one or more redirects.
@@ -134,6 +133,50 @@ pub struct PageData {
     pub not_modified: bool,
     pub extraction: Option<ExtractionResult>,
     pub redirect_chain: Vec<crate::models::RedirectHop>,
+}
+
+impl PageData {
+    /// Minimal record for responses that are not HTML (files, binaries):
+    /// the fetch layer fills in identity, status and size; there is no
+    /// parsed content, and content analyzers skip it.
+    pub fn empty() -> Self {
+        Self {
+            id: 0,
+            url: String::new(),
+            requested_url: String::new(),
+            title: String::new(),
+            title_len: 0,
+            h1: String::new(),
+            h1_len: 0,
+            h2: String::new(),
+            h2_len: 0,
+            description: String::new(),
+            description_len: 0,
+            status: String::new(),
+            mobile: false,
+            language: String::new(),
+            indexability: String::new(),
+            anchor_links: Vec::new(),
+            outlinks: Vec::new(),
+            images: Vec::new(),
+            headings: Vec::new(),
+            headers: Vec::new(),
+            schema: Vec::new(),
+            content_type: String::new(),
+            canonicals: Vec::new(),
+            size: 0,
+            word_count: None,
+            css: None,
+            javascript: None,
+            cwv_desktop: None,
+            cwv_mobile: None,
+            keywords: Vec::new(),
+            extraction: None,
+            redirect_chain: Vec::new(),
+            js_rendered: false,
+            not_modified: false,
+        }
+    }
 }
 
 // Define static CSS selectors for common page elements using LazyLock
@@ -207,7 +250,19 @@ pub fn extract_page_elements(document: &Html) -> PageData {
         .select(&AFREE_SELECTOR)
         .map(|e| {
             let href = e.value().attr("href").unwrap().to_string();
-            let text = e.text().collect::<String>().trim().to_string();
+            let mut text = e.text().collect::<String>().trim().to_string();
+            if text.is_empty() {
+                // Image links and icon links: fall back to aria-label, then to
+                // the first child image's alt text, so the logo link is not
+                // reported as a generic/empty anchor on every page.
+                if let Some(label) = e.value().attr("aria-label") {
+                    text = label.trim().to_string();
+                } else if let Some(image) = e.select(&IMG_SELECTOR).next() {
+                    if let Some(alt) = image.value().attr("alt") {
+                        text = alt.trim().to_string();
+                    }
+                }
+            }
             let rel = e.value().attr("rel").unwrap_or("").to_string();
             AnchorLink { href, text, rel }
         })
@@ -216,14 +271,17 @@ pub fn extract_page_elements(document: &Html) -> PageData {
     // Note: outlinks will be set in fetching.rs with absolutized URLs
     // No need to clone anchor_links here
 
-    // Extract image information including size estimates
+    // Extract image information including size estimates. `has_alt` records
+    // whether the alt attribute exists at all — an explicit alt="" is valid
+    // (decorative image) and must not be reported as missing alt text.
     let images: Vec<ImageInfo> = document
         .select(&IMG_SELECTOR)
         .map(|e| {
             let src = e.value().attr("src").unwrap().to_string();
-            let alt = e.value().attr("alt").unwrap_or("").to_string();
+            let alt_attr = e.value().attr("alt");
+            let alt = alt_attr.unwrap_or("").to_string();
 
-            ImageInfo::new(src, alt)
+            ImageInfo::with_alt_attr(src, alt, alt_attr.is_some())
         })
         .collect();
 
@@ -274,13 +332,10 @@ pub fn extract_page_elements(document: &Html) -> PageData {
         })
         .collect();
 
-    // Calculate content size (character count of body text)
-    let size = document
-        .select(&BODY_SELECTOR)
-        .next()
-        .map(|e| e.text().collect::<String>())
-        .unwrap_or_default()
-        .len();
+    // Calculate content size. The actual response size is set by the fetch
+    // layer (decoded body bytes); this placeholder keeps direct callers of
+    // `extract_page_elements` (tests) working.
+    let size = 0usize;
 
     // Calculate word count for content analysis
     let word_count = Some(get_words(document));
@@ -386,13 +441,13 @@ pub fn extract_page_elements(document: &Html) -> PageData {
         url: "".to_string(),           // Will be set by calling code
         requested_url: "".to_string(), // Will be set by calling code
         title: title.clone(),
-        title_len: title.len(),
+        title_len: title.chars().count(),
         h1: h1.clone(),
-        h1_len: h1.len(),
+        h1_len: h1.chars().count(),
         h2: h2.clone(),
-        h2_len: h2.len(),
+        h2_len: h2.chars().count(),
         description: description.clone(),
-        description_len: description.len(),
+        description_len: description.chars().count(),
         status: "".to_string(), // Will be set by calling code
         mobile,
         language,

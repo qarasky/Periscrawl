@@ -286,9 +286,22 @@ async fn fetch_standard(
         .text()
         .await
         .map_err(|e| format!("Failed to read body: {}", e))?;
-    let document = Html::parse_document(&html_content);
 
-    let mut page_data = extract_page_elements(&document);
+    // Only HTML bodies are parsed. Files (docx/pdf/images…) become minimal
+    // records with identity/status/size, so content analyzers never run on
+    // binary payloads.
+    let is_html = content_type_header
+        .as_deref()
+        .map(|content_type| content_type.to_lowercase().contains("html"))
+        .unwrap_or(true);
+    let mut page_data = if is_html {
+        let document = Html::parse_document(&html_content);
+        extract_page_elements(&document)
+    } else {
+        crate::crawler::helpers::html_parser::PageData::empty()
+    };
+    // "Size (bytes)" is the decoded response body size, not a text-length proxy.
+    page_data.size = html_content.len();
     // Normalize the final (post-redirect) URL so it matches the form other pages'
     // anchor_links/outlinks use when referencing this page - otherwise redirected
     // pages never match url_to_status lookups (e.g. everything looks "unvisited"
@@ -440,6 +453,7 @@ async fn fetch_js(url: &str, base_url: &Url, browser: Arc<Browser>) -> Result<Pa
 
     let document = Html::parse_document(&html_content);
     let mut page_data = extract_page_elements(&document);
+    page_data.size = html_content.len();
     page_data.url = url.to_string();
     page_data.requested_url = url.to_string();
     page_data.status = status;

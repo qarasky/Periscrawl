@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use rustyseo_core::db::{self, SessionRow};
 use rustyseo_core::diff::{self, DiffEntry, DiffStats};
 use rustyseo_core::export::{self, Sheet};
-use rustyseo_core::helpers::issues::IssueAnalyzer;
+use rustyseo_core::helpers::issues::{IssueAnalyzer, IssueFinding};
 use rustyseo_core::models::{AppSettings, PageSummary};
 use rustyseo_core::server::{CrawlOptions, CrawlService};
 use rustyseo_core::PageData;
@@ -76,6 +76,7 @@ pub struct LoadedSession {
     pub pages: Vec<PageData>,
     pub summaries: Vec<PageSummary>,
     pub sheets: Vec<Sheet>,
+    pub findings: Vec<IssueFinding>,
     pub page_count: usize,
 }
 
@@ -154,6 +155,9 @@ pub struct RustySeoApp {
     pub selected_session: Option<i64>,
     pub pages: Vec<PageData>,
     pub summaries: Vec<PageSummary>,
+    /// Issue findings from the shared session analyzer (used by the issue
+    /// detail pane; the Issues tab table comes from the sheets).
+    pub findings: Vec<IssueFinding>,
     page_lookup: HashMap<String, usize>,
     pub sheets: Vec<Sheet>,
     pub active_tab: CentralTab,
@@ -234,6 +238,7 @@ impl RustySeoApp {
             selected_session: None,
             pages: Vec::new(),
             summaries: Vec::new(),
+            findings: Vec::new(),
             page_lookup: HashMap::new(),
             sheets: Vec::new(),
             active_tab: CentralTab::Sheet(0),
@@ -297,12 +302,12 @@ impl RustySeoApp {
             .collect()
     }
 
-    /// Full URL list for an issue (recomputed from the analyzers).
+    /// Full URL list for an issue, from the session analyzer run at load.
     pub fn issue_urls(&self, name: &str) -> Vec<String> {
-        IssueAnalyzer::get_handlers()
+        self.findings
             .iter()
-            .find(|handler| handler.name.trim() == name)
-            .map(|handler| (handler.process)(&self.summaries).1)
+            .find(|finding| finding.name == name)
+            .map(|finding| finding.urls.clone())
             .unwrap_or_default()
     }
 
@@ -366,6 +371,7 @@ impl RustySeoApp {
         self.sheets.clear();
         self.pages.clear();
         self.summaries.clear();
+        self.findings.clear();
         self.page_lookup.clear();
         self.filter.clear();
         self.detail = None;
@@ -389,12 +395,14 @@ impl RustySeoApp {
                 .map(|page| page.summarize(base_domain.as_deref()))
                 .collect();
             let sheets = export::build_report_sheets(&pages, base_domain.as_deref());
+            let findings = IssueAnalyzer::analyze_session(&pages, base_domain.as_deref());
             let _ = tx.send(LoadedSession {
                 session_id: id,
                 page_count: pages.len(),
                 pages,
                 summaries,
                 sheets,
+                findings,
             });
         });
     }
@@ -535,6 +543,7 @@ impl RustySeoApp {
                     self.pages = loaded.pages;
                     self.summaries = loaded.summaries;
                     self.sheets = loaded.sheets;
+                    self.findings = loaded.findings;
                     self.active_tab = CentralTab::Sheet(0);
                     self.status = format!(
                         "Loaded session {} ({} stored pages)",

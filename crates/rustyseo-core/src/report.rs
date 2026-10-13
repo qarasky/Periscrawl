@@ -12,7 +12,7 @@ use printpdf::{GeneratePdfOptions, PdfDocument, PdfSaveOptions};
 
 use crate::crawler::PageData;
 use crate::db::SessionRow;
-use crate::helpers::issues::{IssueAnalyzer, severity_for};
+use crate::helpers::issues::{IssueAnalyzer, IssueFinding, IssueSeverity};
 
 pub struct ReportOptions {
     /// Broken pages listed (default 60).
@@ -44,36 +44,17 @@ pub fn build_session_report_html(
     base_domain: Option<&str>,
     options: &ReportOptions,
 ) -> String {
-    let summaries: Vec<_> = pages
-        .iter()
-        .map(|page| page.summarize(base_domain))
-        .collect();
-
-    // Issue findings, sorted by severity (critical first) then count.
-    let mut findings: Vec<(crate::helpers::issues::IssueSeverity, String, usize)> =
-        IssueAnalyzer::get_handlers()
-            .iter()
-            .filter_map(|handler| {
-                let (count, _) = (handler.process)(&summaries);
-                if count == 0 {
-                    return None;
-                }
-                Some((
-                    severity_for(handler.name),
-                    handler.name.trim().to_string(),
-                    count,
-                ))
-            })
-            .collect();
-    findings.sort_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
-
+    // Issue findings from the shared session analyzer (consistent gating,
+    // includes the whole-crawl link-graph issues).
+    let mut findings: Vec<IssueFinding> = IssueAnalyzer::analyze_session(pages, base_domain);
+    findings.sort_by(|a, b| a.severity.cmp(&b.severity).then(b.count.cmp(&a.count)));
     let (mut critical, mut warning, mut notice, mut total) = (0usize, 0usize, 0usize, 0usize);
-    for (severity, _, count) in &findings {
-        total += count;
-        match severity {
-            crate::helpers::issues::IssueSeverity::Critical => critical += count,
-            crate::helpers::issues::IssueSeverity::Warning => warning += count,
-            crate::helpers::issues::IssueSeverity::Notice => notice += count,
+    for finding in &findings {
+        total += finding.count;
+        match finding.severity {
+            IssueSeverity::Critical => critical += finding.count,
+            IssueSeverity::Warning => warning += finding.count,
+            IssueSeverity::Notice => notice += finding.count,
         }
     }
 
@@ -95,10 +76,10 @@ pub fn build_session_report_html(
         .unwrap_or_else(|_| session.started_at.clone());
     let generated = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
-    let severity_color = |severity: crate::helpers::issues::IssueSeverity| match severity {
-        crate::helpers::issues::IssueSeverity::Critical => "#c0392b",
-        crate::helpers::issues::IssueSeverity::Warning => "#d35400",
-        crate::helpers::issues::IssueSeverity::Notice => "#7f8c8d",
+    let severity_color = |severity: IssueSeverity| match severity {
+        IssueSeverity::Critical => "#c0392b",
+        IssueSeverity::Warning => "#d35400",
+        IssueSeverity::Notice => "#7f8c8d",
     };
 
     let mut html = String::with_capacity(16_384);
@@ -152,13 +133,13 @@ pub fn build_session_report_html(
         html.push_str("<div>No issues detected.</div>\n");
     } else {
         html.push_str("<table><tr><th>Severity</th><th>Issue</th><th class=\"num\">Count</th></tr>\n");
-        for (severity, name, count) in findings.iter().take(options.top_issues) {
+        for finding in findings.iter().take(options.top_issues) {
             html.push_str(&format!(
                 "<tr><td class=\"sev\" style=\"color:{}\">{}</td><td>{}</td><td class=\"num\">{}</td></tr>\n",
-                severity_color(*severity),
-                severity.as_str(),
-                esc(name),
-                count
+                severity_color(finding.severity),
+                finding.severity.as_str(),
+                esc(&finding.name),
+                finding.count
             ));
         }
         html.push_str("</table>\n");

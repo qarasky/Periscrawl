@@ -5,18 +5,38 @@ use url::Url;
 pub struct ImageInfo {
     pub src: String,
     pub alt: String,
+    /// Whether the alt attribute was present at all — an explicit `alt=""` is
+    /// valid for decorative images. `None` for records stored before this
+    /// field existed (legacy heuristic applies).
+    #[serde(default)]
+    pub has_alt: Option<bool>,
     pub size_bytes: Option<u64>,
     pub size_formatted: String,
 }
 
 impl ImageInfo {
-    /// Creates a new ImageInfo instance from image element attributes
+    /// Creates a new ImageInfo instance from image element attributes.
+    /// Alt presence is unknown (`None`); prefer [`ImageInfo::with_alt_attr`].
     pub fn new(src: String, alt: String) -> Self {
         let (size_bytes, size_formatted) = get_image_size_fast(&src);
 
         Self {
             src,
             alt,
+            has_alt: None,
+            size_bytes,
+            size_formatted,
+        }
+    }
+
+    /// Like [`ImageInfo::new`], but records whether the alt attribute existed.
+    pub fn with_alt_attr(src: String, alt: String, has_alt: bool) -> Self {
+        let (size_bytes, size_formatted) = get_image_size_fast(&src);
+
+        Self {
+            src,
+            alt,
+            has_alt: Some(has_alt),
             size_bytes,
             size_formatted,
         }
