@@ -48,7 +48,8 @@ enum Command {
         /// Start URL, e.g. https://example.com
         url: String,
 
-        /// Maximum number of pages to fetch.
+        /// Maximum number of pages to fetch. 0 = no limit: crawl until every
+        /// link is followed or the crawl is stopped.
         #[arg(long)]
         max_pages: Option<usize>,
 
@@ -1611,7 +1612,13 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
                     session.pages_failed,
                     session
                         .max_pages
-                        .map(|m| m.to_string())
+                        .map(|m| {
+                            if m == 0 {
+                                "unlimited".to_string()
+                            } else {
+                                m.to_string()
+                            }
+                        })
                         .unwrap_or_else(|| "-".into()),
                 );
                 println!("  stored    : {page_count} page records");

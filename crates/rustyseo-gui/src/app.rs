@@ -341,7 +341,7 @@ impl RustySeoApp {
         let options = CrawlOptions {
             url: url.clone(),
             name,
-            max_pages: Some(self.form.max_pages.max(1)),
+            max_pages: Some(self.form.max_pages),
             js: self.form.javascript,
         };
 

@@ -155,6 +155,21 @@ impl CrawlEngine {
         self
     }
 
+    /// `max_pages == 0` means unlimited: keep crawling until the frontier is
+    /// exhausted or the crawl is stopped.
+    fn budget_reached(&self, spawned: usize) -> bool {
+        self.max_pages != 0 && spawned >= self.max_pages
+    }
+
+    /// Human-readable page budget for logs (`0` → `unlimited`).
+    fn budget_label(&self) -> String {
+        if self.max_pages == 0 {
+            "unlimited".to_string()
+        } else {
+            self.max_pages.to_string()
+        }
+    }
+
     /// Sets the concurrency limit
     pub fn with_concurrency(mut self, limit: usize) -> Self {
         self.concurrency_limit = limit;
@@ -478,7 +493,7 @@ impl CrawlEngine {
         while !queue.is_empty() || !join_set.is_empty() {
             // Fill up our concurrency quota
             while !queue.is_empty() && join_set.len() < self.concurrency_limit {
-                if spawned >= self.max_pages
+                if self.budget_reached(spawned)
                     || self
                         .stop_flag
                         .as_ref()
@@ -606,7 +621,8 @@ impl CrawlEngine {
                         self.stats.add_discovered(links_found);
 
                         // Only add new links if we haven't reached max successful crawls
-                        if current_success < self.max_pages {
+                        // (or when the budget is unlimited).
+                        if self.max_pages == 0 || current_success < self.max_pages {
                             let mut new_links = Vec::new();
                             let mut filtered_count = 0;
                             let mut duplicate_count = 0;
@@ -693,7 +709,7 @@ impl CrawlEngine {
                                 normalization_failed,
                                 queue.len(),
                                 current_success + 1,
-                                self.max_pages
+                                self.budget_label()
                             );
 
                             // Print summary stats every 50 pages
@@ -757,14 +773,14 @@ impl CrawlEngine {
                 .stop_flag
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Relaxed));
-            if spawned >= self.max_pages || stop_requested {
+            if self.budget_reached(spawned) || stop_requested {
                 queue.clear();
             }
 
             // Diagnostic: Check if queue is empty but we haven't hit max pages
             if queue.is_empty() && join_set.is_empty() {
                 let current = self.success_count.load(Ordering::SeqCst);
-                if current < self.max_pages {
+                if self.max_pages != 0 && current < self.max_pages {
                     tracing::warn!(
                         "[QUEUE EXHAUSTED] Crawl stopped at {} pages (target: {}). No more links to discover. {}",
                         current,

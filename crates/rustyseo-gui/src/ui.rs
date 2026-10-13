@@ -142,7 +142,10 @@ fn left_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
                     ui.end_row();
 
                     ui.label("Max pages");
-                    ui.add(egui::DragValue::new(&mut app.form.max_pages).range(1..=100_000));
+                    ui.add(egui::DragValue::new(&mut app.form.max_pages).range(0..=100_000))
+                        .on_hover_text(
+                            "0 = unlimited: crawl until every link is followed or you press Stop",
+                        );
                     ui.end_row();
 
                     ui.label("Concurrency");
@@ -1177,7 +1180,8 @@ fn settings_window(app: &mut RustySeoApp, ctx: &egui::Context) {
                 .spacing([10.0, 6.0])
                 .show(ui, |ui| {
                     ui.label("Max pages");
-                    ui.add(egui::DragValue::new(&mut draft.crawler.max_pages).range(1..=1_000_000));
+                    ui.add(egui::DragValue::new(&mut draft.crawler.max_pages).range(0..=1_000_000))
+                        .on_hover_text("0 = unlimited: crawl until every link is followed or stopped");
                     ui.end_row();
 
                     ui.label("Concurrency");
