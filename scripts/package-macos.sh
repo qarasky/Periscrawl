@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Build a distributable macOS app bundle for RustySEO.
+# Build a distributable macOS app bundle for Periscrawl.
 #
 # Produces:
-#   dist/RustySEO.app        — double-clickable desktop app (ad-hoc signed)
-#   dist/rustyseo            — the CLI binary
-#   dist/RustySEO-macos.zip  — zipped bundle for sharing
+#   dist/Periscrawl.app        — double-clickable desktop app (ad-hoc signed)
+#   dist/periscrawl            — the CLI binary
+#   dist/Periscrawl-macos.zip  — zipped bundle for sharing
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-NAME="RustySEO"
+NAME="Periscrawl"
 VERSION="0.2.0"
-BUNDLE_ID="com.rustyseo.app"
+BUNDLE_ID="com.periscrawl.app"
 DIST="dist"
 APP="$DIST/$NAME.app"
 
 echo "==> Building release binaries"
-cargo build --release -p rustyseo-gui -p rustyseo-cli
+cargo build --release -p periscrawl-gui -p periscrawl-cli
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "target/release/rustyseo-gui" "$APP/Contents/MacOS/rustyseo-gui"
-cp "target/release/rustyseo" "$DIST/rustyseo" 2>/dev/null || true
+cp "target/release/periscrawl-gui" "$APP/Contents/MacOS/periscrawl-gui"
+cp "target/release/periscrawl" "$DIST/periscrawl" 2>/dev/null || true
 
 echo "==> Generating icon"
 python3 scripts/make_icon.py "$DIST/icon_1024.png"
@@ -46,7 +46,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleExecutable</key><string>rustyseo-gui</string>
+    <key>CFBundleExecutable</key><string>periscrawl-gui</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
@@ -67,7 +67,7 @@ ditto -c -k --keepParent "$APP" "$DIST/$NAME-macos.zip"
 echo
 echo "Done:"
 echo "  $APP"
-echo "  $DIST/rustyseo  (CLI)"
+echo "  $DIST/periscrawl  (CLI)"
 echo "  $DIST/$NAME-macos.zip"
 echo
 echo "Note: teammates opening the zip must allow it once (unsigned developer) —"

@@ -1,0 +1,25 @@
+[package]
+name = "periscrawl-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Periscrawl command line interface — scriptable and agent-friendly."
+
+[[bin]]
+name = "periscrawl"
+path = "src/main.rs"
+
+[dependencies]
+periscrawl-core = { path = "../periscrawl-core" }
+
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url = { workspace = true }

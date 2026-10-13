@@ -1,384 +1,203 @@
-# RustySEO (Terminal)
+# Periscrawl
 
 <div align="center">
 
-![RustySEO Logo](https://github.com/mascanho/RustySEO/raw/main/assets/icon.png)
+<img src="docs/assets/logo.png" width="160" alt="Periscrawl logo">
 
-**A powerful, terminal-based SEO analysis tool built with Rust**
+**See everything on a site — a fast, local SEO crawler with a scriptable CLI,
+a desktop GUI and a terminal UI, built in Rust.**
 
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Crates.io](https://img.shields.io/badge/crates.io-v0.1.0-orange.svg)](https://crates.io/crates/rustyseo-cli)
-
-[Features](#-features) • [Installation](#-installation) • [Usage](#-usage) • [Screenshots](#-screenshots) • [Contributing](#-contributing)
-
-
-![RustySEO Terminal](https://github.com/mascanho/RustySEO/raw/main/assets/tui.webp)
 </div>
 
 ---
 
-## 🚀 About RustySEO
+Periscrawl crawls a website breadth-first — respecting robots.txt, rate limits
+and your page budget — then audits every page for technical SEO problems and
+hands you the results as tables, spreadsheets, JSON, PDF reports, or a live
+sync surface any frontend (or AI agent) can attach to.
 
-RustySEO CLI is a cutting-edge, terminal-based SEO analysis tool that combines the power of Rust with modern web crawling technologies. It provides comprehensive website audits, technical SEO analysis, and actionable insights—all within a beautiful, intuitive terminal interface.
+## Highlights
 
-### ✨ Why RustySEO?
+- **Real crawl engine** — concurrent BFS, robots.txt enforcement, adaptive
+  pacing (429/5xx aware), gzip/deflate, retries, redirect-chain tracking,
+  optional headless-Chrome rendering for client-side pages (byte-identical
+  detection heuristics keep it off when not needed).
+- **Incremental re-crawls** — `--since <session>` uses ETag / Last-Modified so
+  unchanged pages answer `304` and are reused instead of re-downloaded.
+- **Resume & no-limit crawls** — `--resume <session>` continues an interrupted
+  run; `--max-pages 0` crawls until the frontier is empty or you stop it
+  (`periscrawl stop`, or the GUI's Stop button).
+- **36+ issue analyzers** with consistent gating: content checks only look at
+  `2xx` HTML pages (never 404 boilerplate or binary files), and a single
+  session-level entry point feeds the CLI, GUI, exports, PDF and MCP so every
+  surface reports identical numbers.
+- **Whole-crawl link-graph findings** — broken internal links
+  (`source → target (status)`), orphan pages, redirect chains, redirects that
+  land on errors, internal `nofollow`, canonical-to-broken targets.
+- **Measurement you can trust** — title/H1/description lengths are character
+  counts (correct for Cyrillic and all non-Latin text), word counts and
+  keyword extraction read only visible body text (scripts/RSC payloads
+  excluded), `alt=""` is treated as valid (decorative) rather than missing,
+  and `Size (bytes)` is the actual response body size.
+- **Core Web Vitals without the API bill** — optional PageSpeed Insights
+  integration samples smartly: every unique header/nav/footer link, then one
+  representative page per URL template (`/news/*`, `/projects/*`, …). A
+  3,000-page audit costs ~40–60 PSI calls instead of 6,000.
+- **Local-first, agent-friendly** — everything lives in a local SQLite
+  database; the CLI emits NDJSON event streams and documented exit codes, and
+  `periscrawl mcp` exposes crawl control + session queries over MCP stdio.
 
-- **⚡ Blazing Fast**: Built with Rust for maximum performance and reliability
-- **🎯 Comprehensive Analysis**: Detects 15+ types of SEO issues automatically
-- **🌐 Modern Crawling**: JavaScript-enabled crawling with real browser rendering
-- **🤖 AI-Powered Insights**: Integrated AI chat for SEO recommendations
-- **📊 Rich Visualizations**: Beautiful terminal charts and data displays
-- **⚙️ Highly Configurable**: Extensive settings and customization options
+## Getting started
 
----
-
-## 🎯 Features
-
-### 🔍 **Technical SEO Analysis**
-- **HTTP Status Analysis**: 4xx, 5xx, and 3xx redirect detection
-- **Content Optimization**: Title length, meta description analysis
-- **HTML Structure**: H1 tags, alt text, semantic HTML validation
-- **Performance Metrics**: Core Web Vitals and page speed insights
-- **Link Analysis**: Internal/external link discovery and validation
-
-### 🌐 **Advanced Web Crawling**
-- **JavaScript Rendering**: Full browser-based crawling with Headless Chrome
-- **Concurrent Processing**: Multi-threaded crawling for maximum speed
-- **Smart Discovery**: Sitemap and robots.txt parsing
-- **User Agent Rotation**: Realistic browser simulation
-- **Rate Limiting**: Respectful crawling with configurable delays
-
-### 📊 **Data Visualization**
-- **Interactive Tables**: Sortable, filterable data displays
-- **Terminal Charts**: Pie charts, bar graphs, and progress indicators
-- **Color-Coded Issues**: Visual highlighting of problems
-- **Real-time Progress**: Live crawling statistics and updates
-
-### 🤖 **AI Integration**
-- **Smart Recommendations**: AI-powered SEO suggestions
-- **Natural Language Chat**: Ask questions about your SEO data
-- **Multiple Providers**: OpenAI, Gemini, and custom AI endpoints
-- **Context-Aware**: AI understands your specific website data
-
-### ⚙️ **Configuration & Settings**
-- **Persistent Settings**: TOML-based configuration files
-- **Customizable Crawling**: Depth limits, concurrency, timeouts
-- **Export Options**: Data export in multiple formats
-- **Bookmark Management**: Save and organize frequently analyzed sites
-
----
-
-## 📦 Installation
-
-### 🦀 From Source (Recommended)
+### Build from source
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/rustyseo-cli.git
-cd rustyseo-cli
-
-# Build and install
-cargo install --path .
-
-# Or run directly
-cargo run
+cargo build --release
+# binaries: target/release/periscrawl, periscrawl-gui, periscrawl-tui
 ```
 
-### 📦 System Requirements
+Requires a Rust toolchain (stable). Headless Chrome is optional — only needed
+for `--js` / JS-fallback rendering.
 
-- **Rust 1.70+** (for building from source)
-- **Node.js 16+** (for JavaScript crawling features)
-- **Chrome/Chromium** (for headless browser rendering)
-- **Linux/macOS/Windows** support
-
----
-
-## 🎮 Usage
-
-### Quick Start
+### CLI
 
 ```bash
-# Interactive mode (default)
-rustyseo
+# Crawl (delegates to a running GUI/server when one is up; --local opts out)
+periscrawl crawl https://example.com --max-pages 300
 
-# Direct URL analysis
-rustyseo -u https://example.com
+# Unlimited crawl until stopped or every link is followed
+periscrawl crawl https://example.com --max-pages 0
+periscrawl stop
 
-# Help
-rustyseo --help
+# Investigate a session
+periscrawl sessions
+periscrawl session 1 show
+periscrawl session 1 issues --max-urls 5
+
+# Incremental re-crawl + regression check (exit code 6 on regressions)
+periscrawl crawl https://example.com --since 1 --compare 1
+
+# Exports: xlsx (all sheets), csv, json, client-facing pdf
+periscrawl export 1 --format xlsx
+periscrawl export 1 --format pdf
+
+# Attach/automate
+periscrawl serve            # headless crawl server (CLI clients attach)
+periscrawl status | watch | stop
+periscrawl mcp              # MCP server on stdio for AI agents
 ```
 
-### 🎯 Interactive Mode
+Distinct exit codes make it automation-safe: `0` ok, `1` fatal, `2` zero
+pages crawled, `3` config key missing, `6` regressions/sitemap findings,
+`7` watch timeout.
 
-Launch RustySEO and use the intuitive interface:
-
-1. **Enter URL**: Type your website URL and press Enter
-2. **Watch Crawl**: Real-time crawling progress and statistics
-3. **Analyze Results**: Navigate through different analysis tabs
-4. **Get Insights**: Use AI chat for personalized recommendations
-
-### ⌨️ Keyboard Shortcuts
-
-| Category | Shortcut | Action |
-|----------|----------|--------|
-| **Navigation** | `Tab` / `Shift+Tab` | Switch between tabs |
-| | `1-9` / `0` | Jump to specific tab |
-| | `↑/↓` / `j/k` | Navigate lists |
-| | `Enter` | Select item / open details |
-| | `Esc` | Close modal / go back |
-| **Search** | `Ctrl+F` | Open search |
-| | `Enter` | Apply filter |
-| | `Esc` | Close search |
-| **Actions** | `m` | Open actions menu |
-| | `o` | Open URL in browser |
-| | `c` | Copy URL to clipboard |
-| **Interface** | `g` | Open sidebar |
-| | `i` | Issues tab |
-| | `b` | Bookmarks tab |
-| | `t` | Tree view |
-| | `s` | Settings tab |
-| | `L` | Toggle logs |
-| | `?` | Show help |
-| | `q` | Quit application |
-
----
-
-## 📸 Screenshots
-
-### 🎯 Main Dashboard
-![Main Dashboard](https://raw.githubusercontent.com/user-attachments/assets/placeholder-dashboard.png)
-*Comprehensive SEO analysis dashboard with real-time statistics*
-
-### 🔍 Issues Analysis
-![Issues Analysis](https://raw.githubusercontent.com/user-attachments/assets/placeholder-issues.png)
-*Color-coded issue detection with detailed URL listings*
-
-### 🤖 AI Chat Interface
-![AI Chat](https://raw.githubusercontent.com/user-attachments/assets/placeholder-ai-chat.png)
-*AI-powered SEO recommendations and insights*
-
-### 📊 Data Visualization
-![Data Charts](https://raw.githubusercontent.com/user-attachments/assets/placeholder-charts.png)
-*Interactive charts and progress indicators*
-
----
-
-## 🔧 Configuration
-
-RustySEO uses a TOML-based configuration system. Settings are automatically created in:
-
-- **Linux/macOS**: `~/.config/rustyseo/settings.toml`
-- **Windows**: `%APPDATA%\rustyseo\settings.toml`
-
-### Example Configuration
-
-```toml
-[crawler]
-max_pages = 100
-concurrency_limit = 10
-enable_javascript = true
-delay_ms = 1000
-
-[connectors]
-selected = "openai"
-
-[connectors.openai]
-model = "gpt-4"
-api_key = "your-api-key-here"
-
-[ui]
-theme = "dark"
-show_logs = true
-auto_scroll = true
-```
-
----
-
-## 📋 Analysis Types
-
-RustySEO automatically detects and reports on these SEO issues:
-
-### 🚨 **Critical Issues**
-- **4xx Errors**: Broken links and missing pages
-- **5xx Errors**: Server errors and downtime
-- **Missing H1**: No primary heading tags
-
-### ⚠️ **Content Issues**
-- **Title Length**: Too long (>60 chars) or too short (<30 chars)
-- **Meta Descriptions**: Missing or too long (>160 chars)
-- **Missing Alt Text**: Images without accessibility descriptions
-
-### 🔄 **Technical Issues**
-- **3XX Redirects**: Redirect chains and loops
-- **Internal Links**: Broken internal navigation
-- **External Links**: Dead outbound links
-
-### 📈 **Performance Metrics**
-- **Core Web Vitals**: LCP, FID, CLS measurements
-- **Page Speed**: Load time optimization suggestions
-- **Resource Analysis**: Image and script optimization
-
----
-
-## 🤖 AI Integration
-
-RustySEO supports multiple AI providers for intelligent SEO recommendations:
-
-### 🧠 **Supported Providers**
-- **OpenAI GPT-4**: Advanced reasoning and analysis
-- **Google Gemini**: Fast and efficient insights
-- **Custom Endpoints**: Bring your own AI service
-
-### 💬 **AI Chat Features**
-- **Context-Aware**: AI understands your specific website data
-- **Actionable Advice**: Get specific recommendations for each issue
-- **Natural Language**: Ask questions in plain English
-- **Multi-Language**: Support for various languages and regions
-
----
-
-## 🛠️ Advanced Features
-
-### 🌳 **Tree View Navigation**
-- Hierarchical website structure visualization
-- Interactive folder/file exploration
-- Quick navigation to specific pages
-
-### 📚 **Bookmark Management**
-- Save frequently analyzed websites
-- Organize by category or project
-- Quick access from sidebar
-
-### 📊 **Export Capabilities**
-- CSV export for spreadsheet analysis
-- JSON export for programmatic use
-- PDF reports for client presentations
-
-### 🔍 **Search & Filtering**
-- Real-time search across all data
-- Fuzzy matching for flexible queries
-- Filter by issue type or severity
-
----
-
-## 🚧 Development
-
-### 🏗️ Building from Source
+### Desktop GUI
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/rustyseo-cli.git
-cd rustyseo-cli
-
-# Install dependencies
-cargo build
-
-# Run tests
-cargo test
-
-# Run with debug output
-RUST_LOG=debug cargo run
+periscrawl-gui
 ```
 
-### 🧪 Testing
+Sessions browser, crawl form (including “0 = unlimited”), live crawl view with
+Stop, sortable/filterable tables per sheet, page/asset/issue/diff detail
+panes, settings & connectors, and one-click exports (XLSX / CSV / JSON /
+client-facing PDF) that reveal the file when done. The GUI hosts the sync
+server, so `periscrawl status` / `periscrawl crawl` from any terminal attach to
+the crawl that is already running.
+
+### Terminal UI
 
 ```bash
-# Run all tests
-cargo test
-
-# Run specific test module
-cargo test crawler
-
-# Run with coverage
-cargo tarpaulin --out Html
+periscrawl-tui
 ```
 
-### 📝 Code Style
+The classic ratatui experience, sharing the same engine and sessions.
 
-This project uses:
-- **rustfmt** for code formatting
-- **clippy** for linting
-- **pre-commit hooks** for quality assurance
+### Packaged apps
 
----
+```bash
+./scripts/package-macos.sh      # dist/Periscrawl.app (signed ad-hoc) + zip
+./scripts/package-linux.sh      # tar.gz + install.sh + .desktop entry
+./scripts/package-windows.ps1   # zip with exe + start menu hint
+```
 
-## 🤝 Contributing
+## Configuration
 
-We welcome contributions! Here's how to get started:
+Settings live in the platform data directory:
 
-### 🌟 **Ways to Contribute**
+- **macOS**: `~/Library/Application Support/periscrawl/cli-settings.toml`
+- **Linux**: `~/.local/share/periscrawl/cli-settings.toml`
+- **Windows**: `%APPDATA%\periscrawl\data\cli-settings.toml`
 
-1. **🐛 Report Bugs**: Open an issue with detailed information
-2. **💡 Feature Requests**: Suggest new features or improvements
-3. **📝 Documentation**: Help improve README and code comments
-4. **🔧 Code Contributions**: Fix bugs or implement new features
-5. **🧪 Testing**: Write tests and improve coverage
+```bash
+periscrawl config show                 # the full settings file
+periscrawl config set crawler.concurrency 20
+periscrawl config set connectors.pagespeed.api_key <KEY>
+periscrawl config set connectors.pagespeed.status true
+```
 
-### 📋 **Getting Started**
+The PageSpeed Insights key (Google Cloud Console → enable the *PageSpeed
+Insights API* → create an API key) unlocks the CWV columns, the “Slow Load”
+issue and the CWV sheet. Sampling keeps it cheap; leave the toggle off for
+full-site crawls you don't need CWV for.
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/amazing-feature`
-3. Commit your changes: `git commit -m 'Add amazing feature'`
-4. Push to the branch: `git push origin feature/amazing-feature`
-5. Open a Pull Request
+Sessions, pages, exports, logs and the sync token all live next to the
+settings file, never in the cloud.
 
-### 📖 **Guidelines**
+## Issue analysis
 
-- Follow the existing code style
-- Add tests for new features
-- Update documentation as needed
-- Ensure all tests pass before submitting
+Analyzers cover: HTTP status codes (4xx/5xx/3xx), titles/descriptions/H1s
+(missing, duplicated, wrong length — character-accurate), thin content, large
+pages, canonicals (multiple / elsewhere / broken targets), indexability
+(meta robots and X-Robots-Tag), mixed content, redirect behavior, URL quality
+(uppercase paths, underscores, non-ASCII, length, parameters), images
+(missing alt with `alt=""` semantics, oversized, non-WebP), internal link
+graph (broken targets, orphans, nofollow, low link counts), anchors
+(generic/empty — with `aria-label` / image-alt fallbacks), CWV performance,
+analytics/id presence, and sitemap/robots hygiene.
 
----
+## Architecture
 
-## 📜 License
+```
+crates/
+  periscrawl-core   engine: crawler, persistence, settings, analysis. No UI deps.
+  periscrawl-cli    `periscrawl` binary — scriptable / agent-friendly
+  periscrawl-gui    `periscrawl-gui` binary — egui desktop app
+  periscrawl-tui    `periscrawl-tui` binary — ratatui terminal app
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+All state lives in SQLite (WAL) in the platform data directory so any
+frontend can open any crawl session; a loopback socket (`sync.token`-authed)
+adds live control and crawl delegation. Details and phase history in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
----
+## Development
 
-## ⚠️ Disclaimer
+```bash
+cargo test --workspace     # unit + fixture tests
+cargo build --workspace
+```
 
-**🚨 IMPORTANT NOTICE**
+Contributions welcome — keep `periscrawl-core` UI-free, keep analyzer gating
+in the shared runner, and add tests with behavior changes.
 
-RustySEO CLI is provided as-is for educational and analysis purposes. Users are responsible for:
+## Privacy
 
-- **Compliance**: Ensure you have permission to analyze websites
-- **Rate Limiting**: Respect website robots.txt and rate limits
-- **Data Privacy**: Handle sensitive data according to applicable laws
-- **Commercial Use**: Check licensing for commercial applications
+Crawling and analysis are fully local. Network calls happen only to the site
+being crawled, and — only when you configure the keys — to Google's PageSpeed
+Insights API and your chosen AI provider.
 
-**⚠️ NO WARRANTY**: The software is provided "as is" without warranty of any kind. The authors are not liable for any damages arising from the use of this software.
+## License
 
-**🔒 Privacy**: No data is sent to external servers except for configured AI services. All crawling and analysis happens locally on your machine.
+No license file has been added to this repository yet; until one is, all
+rights are reserved by the author. Add a `LICENSE` before distributing.
 
----
+## Acknowledgments
 
-## 🙏 Acknowledgments
-
-- **Rust Community**: For the amazing language and ecosystem
-- **Ratatui**: For the excellent terminal UI framework
-- **Headless Chrome**: For powerful browser automation
-- **All Contributors**: Who help make this project better
-
----
-
-## 📞 Support & Community
-
-- **🐛 Issues**: [GitHub Issues](https://github.com/yourusername/rustyseo-cli/issues)
-- **💬 Discussions**: [GitHub Discussions](https://github.com/yourusername/rustyseo-cli/discussions)
-- **📖 Wiki**: [Project Wiki](https://github.com/yourusername/rustyseo-cli/wiki)
-- **🐦 Twitter**: [@RustySEO_CLI](https://twitter.com/RustySEO_CLI)
-
----
-
-<div align="center">
-
-**⭐ Star this repo if you find it useful!**
-
-Made with ❤️ and 🦀 by the RustySEO Team
-
-[Back to Top](#-rustyseo-cli)
-
-</div>
+- [mascanho/RustySEO-Headless](https://github.com/mascanho/RustySEO-Headless) —
+  the upstream project this repository forked from.
+- [fmfg03/RustySEO](https://github.com/fmfg03/RustySEO) (GPL-3.0) — design
+  reference; features were reimplemented, not copied.
+- Built with [scraper](https://crates.io/crates/scraper),
+  [ratatui](https://crates.io/crates/ratatui),
+  [egui/eframe](https://crates.io/crates/eframe) and
+  [axum](https://crates.io/crates/axum).

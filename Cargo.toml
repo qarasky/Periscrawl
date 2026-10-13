@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rustyseo-core",
-    "crates/rustyseo-cli",
-    "crates/rustyseo-gui",
-    "crates/rustyseo-tui",
+    "crates/periscrawl-core",
+    "crates/periscrawl-cli",
+    "crates/periscrawl-gui",
+    "crates/periscrawl-tui",
 ]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-authors = ["RustySEO contributors"]
+authors = ["Periscrawl contributors"]
 license = "MIT"
 
 [workspace.dependencies]
