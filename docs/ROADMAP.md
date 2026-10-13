@@ -87,7 +87,8 @@ Rules:
       (search + AI crawlers classified), status/file-type breakdowns, top paths,
       error paths, top IPs and per-day crawl-waste views; `--json` for agents
 - [ ] GUI surface for the log analyzer (tabs/charts)
-- [ ] PDF reporting (client-facing session reports)
+- [x] PDF reporting: `rustyseo export <session> --format pdf` + GUI "Export PDF" —
+      styled client-facing report (summary tiles, issues by severity, broken pages)
 - [ ] GSC / GA4 / Clarity connectors
 - [ ] Keyword & content tooling (tracking, topics, content planner)
 

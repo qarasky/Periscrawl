@@ -84,6 +84,7 @@ pub enum ExportKind {
     Xlsx,
     CsvZip,
     Json,
+    Pdf,
 }
 
 /// Which view the central panel shows.
@@ -477,6 +478,24 @@ impl RustySeoApp {
                             session.ok_or_else(|| anyhow::anyhow!("session {sid} not found"))?;
                         let value = export::report_json(&session, &sheets)?;
                         std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
+                        Ok(path)
+                    }
+                    ExportKind::Pdf => {
+                        let path = dir.join(format!("rustyseo_session{sid}_{timestamp}.pdf"));
+                        let session =
+                            session.ok_or_else(|| anyhow::anyhow!("session {sid} not found"))?;
+                        let pages = db::load_session_pages(sid)
+                            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                        let base_domain = url::Url::parse(&session.start_url)
+                            .ok()
+                            .and_then(|url| url.host_str().map(|host| host.to_string()));
+                        rustyseo_core::report::write_session_pdf(
+                            &session,
+                            &pages,
+                            base_domain.as_deref(),
+                            &path,
+                            &Default::default(),
+                        )?;
                         Ok(path)
                     }
                 }

@@ -11,6 +11,7 @@ use rustyseo_core::db;
 use rustyseo_core::export;
 use rustyseo_core::helpers::issues::{IssueAnalyzer, severity_for};
 use rustyseo_core::models::PageSummary;
+use rustyseo_core::report;
 use rustyseo_core::server::SyncClient;
 
 pub async fn serve() -> anyhow::Result<()> {
@@ -148,7 +149,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "session_export",
-            "description": "Export a session. format=json returns the report inline; format=xlsx or csv writes a file (out_path or the exports dir) and returns its path.",
+            "description": "Export a session. format=json returns the report inline; format=pdf, xlsx or csv writes a file (out_path or the exports dir) and returns its path.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -291,12 +292,16 @@ async fn call_tool(name: &str, args: &Value) -> Result<String, String> {
                     let value = export::report_json(&session, &sheets).map_err(|err| err.to_string())?;
                     serde_json::to_string_pretty(&value).map_err(|err| err.to_string())
                 }
-                "xlsx" | "csv" => {
+                "xlsx" | "csv" | "pdf" => {
                     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
                     let path = match args.get("out_path").and_then(Value::as_str) {
                         Some(path) => std::path::PathBuf::from(path),
                         None => {
-                            let ext = if format == "xlsx" { "xlsx" } else { "zip" };
+                            let ext = match format.as_str() {
+                                "xlsx" => "xlsx",
+                                "pdf" => "pdf",
+                                _ => "zip",
+                            };
                             export::exports_dir()
                                 .map_err(|err| err.to_string())?
                                 .join(format!("rustyseo_session{session_id}_{timestamp}.{ext}"))
@@ -304,6 +309,15 @@ async fn call_tool(name: &str, args: &Value) -> Result<String, String> {
                     };
                     if format == "xlsx" {
                         export::write_xlsx(&sheets, &path).map_err(|err| err.to_string())?;
+                    } else if format == "pdf" {
+                        report::write_session_pdf(
+                            &session,
+                            &pages,
+                            base_domain.as_deref(),
+                            &path,
+                            &Default::default(),
+                        )
+                        .map_err(|err| err.to_string())?;
                     } else if let Some(tab) = args.get("tab").and_then(Value::as_str) {
                         let sheet = sheets
                             .iter()

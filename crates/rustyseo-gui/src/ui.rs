@@ -84,6 +84,12 @@ fn top_panel(app: &mut RustySeoApp, ui: &mut egui::Ui) {
                 }
                 let exporting_enabled = !app.sheets.is_empty() && app.crawl.is_none();
                 if ui
+                    .add_enabled(exporting_enabled, egui::Button::new("Export PDF"))
+                    .clicked()
+                {
+                    app.export_current(ExportKind::Pdf);
+                }
+                if ui
                     .add_enabled(exporting_enabled, egui::Button::new("Export .json"))
                     .clicked()
                 {

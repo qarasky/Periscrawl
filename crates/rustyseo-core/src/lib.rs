@@ -14,6 +14,7 @@ pub mod helpers;
 pub mod loganalyzer;
 pub mod logging;
 pub mod models;
+pub mod report;
 pub mod server;
 pub mod settings;
 

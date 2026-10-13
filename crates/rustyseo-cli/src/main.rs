@@ -283,6 +283,7 @@ enum ExportFormat {
     Json,
     Xlsx,
     Csv,
+    Pdf,
 }
 
 #[derive(Subcommand)]
@@ -1640,6 +1641,17 @@ fn export(
                 rustyseo_core::export::write_csv_zip(&sheets, &path)?;
                 println!("{}", path.display());
             }
+        }
+        ExportFormat::Pdf => {
+            let path = target("pdf")?;
+            rustyseo_core::report::write_session_pdf(
+                &session,
+                &pages,
+                base_domain.as_deref(),
+                &path,
+                &Default::default(),
+            )?;
+            println!("{}", path.display());
         }
     }
     Ok(ExitCode::SUCCESS)
