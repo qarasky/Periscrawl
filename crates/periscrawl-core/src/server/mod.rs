@@ -11,6 +11,7 @@ mod client;
 
 pub use client::SyncClient;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,9 +57,30 @@ pub struct RunningState {
     pub processing: AtomicUsize,
 }
 
+/// Live counters for one running crawl.
+#[derive(Serialize, Clone)]
+pub struct CrawlStatus {
+    pub session_id: i64,
+    pub url: String,
+    pub pages: usize,
+    pub failed: usize,
+    pub scanned: usize,
+    pub queued: usize,
+    pub processing: usize,
+    pub robots_blocked: usize,
+    pub js_renders: usize,
+    pub not_modified: usize,
+    pub elapsed_ms: u64,
+    pub stop_requested: bool,
+}
+
 #[derive(Serialize)]
 pub struct StatusSnapshot {
     pub running: bool,
+    /// Every crawl running right now (crawls run in parallel).
+    pub crawls: Vec<CrawlStatus>,
+    // Legacy top-level fields mirror the first running crawl so simple
+    // clients keep working while the list is the source of truth.
     pub url: Option<String>,
     pub session_id: Option<i64>,
     pub pages: usize,
@@ -81,7 +103,7 @@ pub struct CrawlService {
 }
 
 struct ServiceInner {
-    current: Mutex<Option<Arc<RunningState>>>,
+    running: Mutex<HashMap<i64, Arc<RunningState>>>,
     events: broadcast::Sender<Value>,
 }
 
@@ -96,7 +118,7 @@ impl CrawlService {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(ServiceInner {
-                current: Mutex::new(None),
+                running: Mutex::new(HashMap::new()),
                 events,
             }),
         }
@@ -108,61 +130,93 @@ impl CrawlService {
 
     pub fn is_running(&self) -> bool {
         self.inner
-            .current
+            .running
             .lock()
-            .map(|current| current.is_some())
+            .map(|running| !running.is_empty())
             .unwrap_or(false)
     }
 
-    fn current(&self) -> Option<Arc<RunningState>> {
-        self.inner
-            .current
+    /// Session ids of the crawls running right now (oldest first).
+    pub fn running_session_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .inner
+            .running
             .lock()
-            .ok()
-            .and_then(|current| current.clone())
+            .map(|running| running.keys().copied().collect())
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids
     }
 
-    pub fn status(&self) -> StatusSnapshot {
-        match self.current() {
-            Some(running) => {
-                let stats = running.stats.lock().ok().and_then(|s| s.clone());
-                StatusSnapshot {
-                    running: true,
-                    url: Some(running.url.clone()),
-                    session_id: Some(running.session_id),
-                    pages: running.pages.load(Ordering::SeqCst),
-                    failed: running.failed.load(Ordering::SeqCst),
-                    scanned: running.scanned.load(Ordering::SeqCst),
-                    queued: running.queued.load(Ordering::SeqCst),
-                    processing: running.processing.load(Ordering::SeqCst),
-                    robots_blocked: stats.as_ref().map(|s| s.robots_blocked()).unwrap_or(0),
-                    js_renders: stats.as_ref().map(|s| s.js_renders()).unwrap_or(0),
-                    not_modified: stats.as_ref().map(|s| s.not_modified()).unwrap_or(0),
-                    elapsed_ms: running.started.elapsed().as_millis() as u64,
-                    stop_requested: running.stop.load(Ordering::SeqCst),
-                }
-            }
-            None => StatusSnapshot {
-                running: false,
-                url: None,
-                session_id: None,
-                pages: 0,
-                failed: 0,
-                scanned: 0,
-                queued: 0,
-                processing: 0,
-                robots_blocked: 0,
-                js_renders: 0,
-                not_modified: 0,
-                elapsed_ms: 0,
-                stop_requested: false,
-            },
+    fn running_states(&self) -> Vec<Arc<RunningState>> {
+        let mut states: Vec<Arc<RunningState>> = self
+            .inner
+            .running
+            .lock()
+            .map(|running| running.values().cloned().collect())
+            .unwrap_or_default();
+        states.sort_by_key(|state| state.session_id);
+        states
+    }
+
+    fn snapshot(running: &Arc<RunningState>) -> CrawlStatus {
+        let stats = running.stats.lock().ok().and_then(|s| s.clone());
+        CrawlStatus {
+            session_id: running.session_id,
+            url: running.url.clone(),
+            pages: running.pages.load(Ordering::SeqCst),
+            failed: running.failed.load(Ordering::SeqCst),
+            scanned: running.scanned.load(Ordering::SeqCst),
+            queued: running.queued.load(Ordering::SeqCst),
+            processing: running.processing.load(Ordering::SeqCst),
+            robots_blocked: stats.as_ref().map(|s| s.robots_blocked()).unwrap_or(0),
+            js_renders: stats.as_ref().map(|s| s.js_renders()).unwrap_or(0),
+            not_modified: stats.as_ref().map(|s| s.not_modified()).unwrap_or(0),
+            elapsed_ms: running.started.elapsed().as_millis() as u64,
+            stop_requested: running.stop.load(Ordering::SeqCst),
         }
     }
 
-    /// Ask the running crawl to stop (drains in-flight requests, then ends).
-    pub fn stop(&self) -> bool {
-        match self.current() {
+    pub fn status(&self) -> StatusSnapshot {
+        let crawls: Vec<CrawlStatus> = self.running_states().iter().map(Self::snapshot).collect();
+        let first = crawls.first();
+        StatusSnapshot {
+            running: !crawls.is_empty(),
+            url: first.map(|c| c.url.clone()),
+            session_id: first.map(|c| c.session_id),
+            pages: first.map(|c| c.pages).unwrap_or(0),
+            failed: first.map(|c| c.failed).unwrap_or(0),
+            scanned: first.map(|c| c.scanned).unwrap_or(0),
+            queued: first.map(|c| c.queued).unwrap_or(0),
+            processing: first.map(|c| c.processing).unwrap_or(0),
+            robots_blocked: first.map(|c| c.robots_blocked).unwrap_or(0),
+            js_renders: first.map(|c| c.js_renders).unwrap_or(0),
+            not_modified: first.map(|c| c.not_modified).unwrap_or(0),
+            elapsed_ms: first.map(|c| c.elapsed_ms).unwrap_or(0),
+            stop_requested: first.map(|c| c.stop_requested).unwrap_or(false),
+            crawls,
+        }
+    }
+
+    /// Ask every running crawl to stop. Returns how many were asked.
+    /// Stopping aborts in-flight requests immediately.
+    pub fn stop(&self) -> usize {
+        let states = self.running_states();
+        for running in &states {
+            running.stop.store(true, Ordering::SeqCst);
+        }
+        states.len()
+    }
+
+    /// Ask one crawl to stop (used by the GUI's per-crawl Stop button).
+    pub fn stop_session(&self, session_id: i64) -> bool {
+        let state = self
+            .inner
+            .running
+            .lock()
+            .ok()
+            .and_then(|running| running.get(&session_id).cloned());
+        match state {
             Some(running) => {
                 running.stop.store(true, Ordering::SeqCst);
                 true
@@ -172,51 +226,50 @@ impl CrawlService {
     }
 
     /// Start a crawl and broadcast its events. Returns the session id.
+    /// Any number of crawls can run in parallel; the service keeps them in a
+    /// map keyed by session id.
     pub async fn start_crawl(&self, options: CrawlOptions) -> Result<i64, String> {
         if url::Url::parse(&options.url).is_err() {
             return Err(format!("invalid URL: {}", options.url));
         }
+        let settings = AppSettings::load();
+        let max_pages = options.max_pages.unwrap_or(settings.crawler.max_pages);
+        let session_id = db::create_session(options.name.as_deref(), &options.url, Some(max_pages))
+            .map_err(|err| format!("could not create session: {err}"))?;
+
+        let running = Arc::new(RunningState {
+            session_id,
+            url: options.url.clone(),
+            started: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            stats: Mutex::new(None),
+            pages: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            scanned: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            processing: AtomicUsize::new(0),
+        });
         {
-            let mut current = self
+            let mut active = self
                 .inner
-                .current
+                .running
                 .lock()
                 .map_err(|_| "service lock poisoned".to_string())?;
-            if current.is_some() {
-                return Err("a crawl is already running".to_string());
-            }
-            let settings = AppSettings::load();
-            let max_pages = options.max_pages.unwrap_or(settings.crawler.max_pages);
-            let session_id = db::create_session(options.name.as_deref(), &options.url, Some(max_pages))
-                .map_err(|err| format!("could not create session: {err}"))?;
+            active.insert(session_id, running.clone());
+        }
 
-            let running = Arc::new(RunningState {
-                session_id,
-                url: options.url.clone(),
-                started: Instant::now(),
-                stop: Arc::new(AtomicBool::new(false)),
-                stats: Mutex::new(None),
-                pages: AtomicUsize::new(0),
-                failed: AtomicUsize::new(0),
-                scanned: AtomicUsize::new(0),
-                queued: AtomicUsize::new(0),
-                processing: AtomicUsize::new(0),
-            });
-            *current = Some(running.clone());
-            drop(current);
+        let _ = self.inner.events.send(json!({
+            "event": "crawl.start",
+            "url": options.url,
+            "session_id": session_id,
+        }));
 
-            let _ = self.inner.events.send(json!({
-                "event": "crawl.start",
-                "url": options.url,
-                "session_id": session_id,
-            }));
+        let service = self.clone();
+        let running_task = running.clone();
+        let url = options.url.clone();
+        let js = options.js;
 
-            let service = self.clone();
-            let running_task = running.clone();
-            let url = options.url.clone();
-            let js = options.js;
-
-            tokio::spawn(async move {
+        tokio::spawn(async move {
                 let settings = AppSettings::load();
                 let max_pages = options.max_pages.unwrap_or(settings.crawler.max_pages);
                 let mut engine = CrawlEngine::new()
@@ -261,6 +314,7 @@ impl CrawlService {
                             running_task.failed.store(failed, Ordering::SeqCst);
                             let _ = service.inner.events.send(json!({
                                 "event": "page",
+                                "session_id": session_id,
                                 "id": page.id,
                                 "url": page.url,
                                 "status": page.status,
@@ -279,6 +333,7 @@ impl CrawlService {
                             running_task.processing.store(processing, Ordering::SeqCst);
                             let _ = service.inner.events.send(json!({
                                 "event": "progress",
+                                "session_id": session_id,
                                 "scanned": scanned,
                                 "queued": queued,
                                 "processing": processing,
@@ -302,13 +357,12 @@ impl CrawlService {
                     "status": status,
                     "elapsed_ms": running_task.started.elapsed().as_millis() as u64,
                 }));
-                if let Ok(mut current) = service.inner.current.lock() {
-                    *current = None;
+                if let Ok(mut active) = service.inner.running.lock() {
+                    active.remove(&session_id);
                 }
             });
 
-            Ok(session_id)
-        }
+        Ok(session_id)
     }
 }
 
@@ -490,7 +544,13 @@ async fn handle_connection(stream: TcpStream, service: CrawlService, token: Stri
                 }
             }
             "crawl.stop" => {
-                let message = reply(id, Ok(json!({"stopped": service.stop()})));
+                let result = match params.get("session_id").and_then(Value::as_i64) {
+                    Some(session_id) => Ok(json!({
+                        "stopped": usize::from(service.stop_session(session_id))
+                    })),
+                    None => Ok(json!({ "stopped": service.stop() })),
+                };
+                let message = reply(id, result);
                 if write_half.write_all(&message).await.is_err() {
                     return;
                 }
@@ -510,7 +570,11 @@ async fn handle_connection(stream: TcpStream, service: CrawlService, token: Stri
                 }
             }
             "subscribe" => {
-                if !service.is_running() {
+                // Optional filter: follow only one session's events. Without a
+                // filter the stream stays open (the client decides when to
+                // leave, e.g. after the first crawl.end).
+                let filter = params.get("session_id").and_then(Value::as_i64);
+                if filter.is_none() && !service.is_running() {
                     let message = reply(id, Err("no crawl is running".to_string()));
                     if write_half.write_all(&message).await.is_err() {
                         return;
@@ -525,6 +589,7 @@ async fn handle_connection(stream: TcpStream, service: CrawlService, token: Stri
                 loop {
                     match events.recv().await {
                         Ok(event) => {
+                            let event_session = event.get("session_id").and_then(Value::as_i64);
                             let is_end = event.get("event").and_then(Value::as_str)
                                 == Some("crawl.end");
                             let mut bytes = event.to_string();
@@ -533,7 +598,15 @@ async fn handle_connection(stream: TcpStream, service: CrawlService, token: Stri
                                 return;
                             }
                             if is_end {
-                                return;
+                                match filter {
+                                    // Follow one session: done when it ends.
+                                    Some(session_id) if event_session == Some(session_id) => {
+                                        return;
+                                    }
+                                    Some(_) => {}
+                                    // Unfiltered stream: keep going.
+                                    None => {}
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {

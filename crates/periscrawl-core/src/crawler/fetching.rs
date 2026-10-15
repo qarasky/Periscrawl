@@ -21,6 +21,18 @@ pub enum FetchOutcome {
     NotModified,
 }
 
+/// PageSpeed context for one fetch, borrowed from the engine. When the crawl
+/// is stored (session present), PSI calls run in the background under the
+/// shared permit pool so they never block crawl slots; one-shot `--no-db`
+/// crawls keep them inline so the results stay on the page records.
+pub struct PsiRef<'a> {
+    pub config: &'a crate::models::PageSpeedConfig,
+    pub sampler: &'a crate::crawler::helpers::psi::PsiSampler,
+    pub semaphore: &'a Arc<tokio::sync::Semaphore>,
+    pub client: &'a Client,
+    pub session_id: Option<i64>,
+}
+
 /// Extract ETag / Last-Modified validators from a stored page's headers.
 pub fn validators_from(page: &PageData) -> Option<FetchValidators> {
     let mut validators = FetchValidators::default();
@@ -50,8 +62,7 @@ pub async fn fetch_and_process(
     client: &Client,
     browser: &Option<Arc<Browser>>,
     user_agents: &[String],
-    pagespeed_config: &Option<crate::models::PageSpeedConfig>,
-    psi_sampler: Option<&crate::crawler::helpers::psi::PsiSampler>,
+    psi: Option<&PsiRef<'_>>,
     enable_javascript: bool,
     js_fallback: bool,
     validators: Option<&FetchValidators>,
@@ -102,29 +113,88 @@ pub async fn fetch_and_process(
         }
     };
 
-    if let Some(config) = pagespeed_config {
-        if config.status && !config.api_key.is_empty() {
-            if let Some(sampler) = psi_sampler {
-                sampler.add_nav_targets(&page_data.nav_link_targets);
-            }
+    if let Some(psi) = psi {
+        if psi.config.status && !psi.config.api_key.is_empty() {
+            psi.sampler.add_nav_targets(&page_data.nav_link_targets);
             let is_html = page_data.content_type.to_lowercase().contains("text/html");
             let is_ok = page_data.status.starts_with('2');
-            // PageSpeed sampling: navigation pages (once each) and the first
-            // page of every template group. The sampler keeps the whole crawl
-            // to a handful of PSI calls instead of two per page.
-            let sampled = psi_sampler
-                .map(|sampler| sampler.should_sample(&page_data.url))
-                .unwrap_or(true);
+            let sampled = psi.sampler.should_sample(&page_data.url);
             if is_html && is_ok && sampled {
-                tracing::info!("[CWV] Fetching PageSpeed for {}", url);
-                match fetch_pagespeed_data(client, url, "desktop", &config.api_key).await {
-                    Ok(cwv) => page_data.cwv_desktop = Some(cwv),
-                    Err(e) => tracing::error!("[CWV] Desktop failed for {}: {}", url, e),
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                match fetch_pagespeed_data(client, url, "mobile", &config.api_key).await {
-                    Ok(cwv) => page_data.cwv_mobile = Some(cwv),
-                    Err(e) => tracing::error!("[CWV] Mobile failed for {}: {}", url, e),
+                match psi.session_id {
+                    // Stored crawl: run PSI in the background (bounded permit
+                    // pool) so slow API calls never hold a crawl slot. The
+                    // worker writes into the stored page once done.
+                    Some(session_id) => {
+                        let client = psi.client.clone();
+                        let permit_pool = psi.semaphore.clone();
+                        let api_key = psi.config.api_key.clone();
+                        let page_url = page_data.url.clone();
+                        tracing::info!("[CWV] Queued PageSpeed for {}", page_url);
+                        tokio::spawn(async move {
+                            let _permit = permit_pool.acquire_owned().await.ok();
+                            let desktop =
+                                match fetch_pagespeed_data(&client, &page_url, "desktop", &api_key)
+                                    .await
+                                {
+                                    Ok(cwv) => Some(cwv),
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "[CWV] Desktop failed for {}: {}",
+                                            page_url,
+                                            err
+                                        );
+                                        None
+                                    }
+                                };
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            let mobile =
+                                match fetch_pagespeed_data(&client, &page_url, "mobile", &api_key)
+                                    .await
+                                {
+                                    Ok(cwv) => Some(cwv),
+                                    Err(err) => {
+                                        tracing::error!(
+                                            "[CWV] Mobile failed for {}: {}",
+                                            page_url,
+                                            err
+                                        );
+                                        None
+                                    }
+                                };
+                            if desktop.is_some() || mobile.is_some() {
+                                if let Err(err) = crate::db::update_page_cwv(
+                                    session_id,
+                                    &page_url,
+                                    desktop.as_ref(),
+                                    mobile.as_ref(),
+                                ) {
+                                    tracing::warn!(
+                                        "[CWV] Could not store results for {}: {}",
+                                        page_url,
+                                        err
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    // No stored session (`--no-db`): keep the results inline
+                    // so they stay on the page records of this run.
+                    None => {
+                        tracing::info!("[CWV] Fetching PageSpeed for {}", url);
+                        match fetch_pagespeed_data(psi.client, url, "desktop", &psi.config.api_key)
+                            .await
+                        {
+                            Ok(cwv) => page_data.cwv_desktop = Some(cwv),
+                            Err(e) => tracing::error!("[CWV] Desktop failed for {}: {}", url, e),
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        match fetch_pagespeed_data(psi.client, url, "mobile", &psi.config.api_key)
+                            .await
+                        {
+                            Ok(cwv) => page_data.cwv_mobile = Some(cwv),
+                            Err(e) => tracing::error!("[CWV] Mobile failed for {}: {}", url, e),
+                        }
+                    }
                 }
             }
         }

@@ -497,7 +497,7 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
-fn sheet_to_csv(sheet: &Sheet) -> String {
+pub fn sheet_to_csv(sheet: &Sheet) -> String {
     let mut out = String::new();
     out.push_str(
         &sheet
@@ -525,6 +525,16 @@ pub fn write_csv(sheet: &Sheet, path: &Path) -> Result<()> {
         .with_context(|| format!("could not create {}", path.display()))?;
     file.write_all(sheet_to_csv(sheet).as_bytes())?;
     Ok(())
+}
+
+/// The user's Documents folder (used by the GUI's AI prompt export).
+pub fn documents_dir() -> Result<PathBuf> {
+    let user_dirs =
+        directories::UserDirs::new().context("could not determine the home directory")?;
+    Ok(user_dirs
+        .document_dir()
+        .map(|dir| dir.to_path_buf())
+        .unwrap_or_else(|| user_dirs.home_dir().to_path_buf()))
 }
 
 /// One CSV per sheet, bundled into a zip.

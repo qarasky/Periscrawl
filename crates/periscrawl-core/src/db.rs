@@ -1,5 +1,5 @@
 use crate::crawler::PageData;
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -312,6 +312,44 @@ pub fn load_session_pages(session_id: i64) -> SqliteResult<Vec<PageData>> {
         .filter_map(|data| serde_json::from_str(&data).ok())
         .collect();
     Ok(rows)
+}
+
+/// Store PageSpeed results for an already-persisted page. Background CWV
+/// workers call this after the crawl has moved on (and sometimes after the
+/// session is marked finished), so it tolerates racing the crawl's own
+/// batched inserts.
+pub fn update_page_cwv(
+    session_id: i64,
+    url: &str,
+    desktop: Option<&crate::crawler::helpers::html_parser::CwvData>,
+    mobile: Option<&crate::crawler::helpers::html_parser::CwvData>,
+) -> SqliteResult<()> {
+    let conn = Connection::open(get_db_path())?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    let row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT page_id, data FROM pages WHERE session_id = ?1 AND url = ?2 LIMIT 1",
+            params![session_id, url],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((page_id, data)) = row else {
+        return Ok(());
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return Ok(());
+    };
+    if let Some(desktop) = desktop {
+        value["cwv_desktop"] = serde_json::to_value(desktop).unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(mobile) = mobile {
+        value["cwv_mobile"] = serde_json::to_value(mobile).unwrap_or(serde_json::Value::Null);
+    }
+    conn.execute(
+        "UPDATE pages SET data = ?1 WHERE session_id = ?2 AND page_id = ?3",
+        params![value.to_string(), session_id, page_id],
+    )?;
+    Ok(())
 }
 
 /// Lightweight rows for display / JSON output.

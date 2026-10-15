@@ -8,6 +8,7 @@ use egui_extras::{Column, TableBuilder};
 
 use periscrawl_core::diff::DiffKind;
 use periscrawl_core::export::{self, Sheet};
+use periscrawl_core::helpers::issues::IssueSeverity;
 
 use crate::app::{AssetKind, CentralTab, DetailView, ExportKind, PeriscrawlApp};
 
@@ -17,6 +18,10 @@ const WARN_YELLOW: Color32 = Color32::from_rgb(255, 195, 100);
 const ERR_RED: Color32 = Color32::from_rgb(255, 110, 110);
 
 pub fn draw(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
+    // egui owns the clipboard: apply anything the app queued this frame.
+    if let Some(text) = app.pending_clipboard.take() {
+        ui.ctx().copy_text(text);
+    }
     top_panel(app, ui);
     left_panel(app, ui);
     bottom_panel(app, ui);
@@ -82,7 +87,18 @@ fn top_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
                 if ui.button("⚙ Settings").clicked() {
                     app.open_settings();
                 }
-                let exporting_enabled = !app.sheets.is_empty() && app.crawl.is_none();
+                let exporting_enabled = !app.sheets.is_empty();
+                if ui
+                    .add_enabled(exporting_enabled, egui::Button::new("Export prompt (AI)"))
+                    .on_hover_text(
+                        "Writes this session's Overview CSV to your Documents folder and copies a short prompt for an AI assistant",
+                    )
+                    .clicked()
+                {
+                    if let Err(err) = app.export_ai_prompt() {
+                        app.status = format!("AI export failed: {err}");
+                    }
+                }
                 if ui
                     .add_enabled(exporting_enabled, egui::Button::new("Export PDF"))
                     .clicked()
@@ -158,18 +174,20 @@ fn left_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
                 });
 
             ui.add_space(6.0);
-            let crawling = app.crawl.is_some();
             if ui
-                .add_enabled(
-                    !crawling,
-                    egui::Button::new(RichText::new("Start crawl").strong()),
-                )
+                .add(egui::Button::new(RichText::new("Start crawl").strong()))
                 .clicked()
             {
                 app.start_crawl();
             }
-            if crawling {
-                ui.label(RichText::new("Crawl in progress…").italics());
+            let running = app.crawls.len();
+            if running > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "{running} crawl(s) running — more can start in parallel"
+                    ))
+                    .italics(),
+                );
             }
 
             ui.separator();
@@ -199,17 +217,26 @@ fn left_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
                             session.pages_fetched
                         );
                         let selected = app.selected_session == Some(session.id);
-                        if ui
-                            .selectable_label(selected, label)
-                            .on_hover_text(format!(
-                                "{}\nstarted {}",
-                                session.start_url,
-                                format_started(&session.started_at)
-                            ))
-                            .clicked()
-                        {
-                            clicked = Some(session.id);
-                        }
+                        let crawling = app.crawls.contains_key(&session.id);
+                        ui.horizontal(|ui| {
+                            if crawling {
+                                ui.add(egui::Spinner::new().size(12.0));
+                            } else {
+                                ui.add_space(16.0);
+                            }
+                            if ui
+                                .selectable_label(selected, label)
+                                .on_hover_text(format!(
+                                    "{}\nstarted {}{}",
+                                    session.start_url,
+                                    format_started(&session.started_at),
+                                    if crawling { "\ncrawling right now" } else { "" }
+                                ))
+                                .clicked()
+                            {
+                                clicked = Some(session.id);
+                            }
+                        });
                         ui.label(
                             RichText::new(format!(
                                 "    {} • {}",
@@ -231,18 +258,26 @@ fn bottom_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
     egui::Panel::bottom("status").show(ui, |ui| {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            match &app.crawl {
+            match app.focused_crawl() {
                 Some(crawl) => {
                     ui.spinner();
+                    let runs = app.crawls.len();
+                    let runs_note = if runs > 1 {
+                        format!(" • {runs} crawls running")
+                    } else {
+                        String::new()
+                    };
                     ui.label(format!(
-                        "Crawling • {} pages • {} failed • queued {} • processing {} • {} robots-blocked • {:.0}s{}",
+                        "Crawling #{} • {} pages • {} failed • queued {} • processing {} • {} robots-blocked • {:.0}s{}{}",
+                        crawl.session_id.unwrap_or(-1),
                         crawl.pages,
                         crawl.failed,
                         crawl.queued,
                         crawl.processing,
                         crawl.robots_blocked,
                         crawl.started.elapsed().as_secs_f32(),
-                        if crawl.stop_requested { " • stopping" } else { "" }
+                        if crawl.stop_requested { " • stopping" } else { "" },
+                        runs_note,
                     ));
                 }
                 None => {
@@ -282,7 +317,7 @@ fn bottom_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
 
 fn central(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
-        if app.crawl.is_some() {
+        if !app.crawls.is_empty() {
             live_view(app, ui);
             return;
         }
@@ -304,6 +339,8 @@ fn central(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
             return;
         }
 
+        stat_rings(app, ui);
+        ui.add_space(6.0);
         tab_bar(app, ui);
         ui.add_space(4.0);
 
@@ -1083,14 +1120,45 @@ fn diff_entry_detail(app: &PeriscrawlApp, ui: &mut egui::Ui, index: usize) -> Op
 
 fn live_view(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
     let mut stop_clicked = false;
+    let mut focus_change: Option<i64> = None;
+
+    // Selector when several crawls run in parallel.
+    let running = app.running_sessions();
+    if running.len() > 1 {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Running:").weak());
+            for id in &running {
+                let pages = app.crawls.get(id).map(|crawl| crawl.pages).unwrap_or(0);
+                let selected = app.crawl_focus == Some(*id);
+                if ui
+                    .selectable_label(selected, format!("#{id} — {pages} pages"))
+                    .clicked()
+                {
+                    focus_change = Some(*id);
+                }
+            }
+        });
+        ui.add_space(2.0);
+    }
+    if let Some(id) = focus_change {
+        app.crawl_focus = Some(id);
+    }
+
     {
-        let Some(crawl) = app.crawl.as_ref() else {
+        let Some(crawl) = app.focused_crawl() else {
             return;
         };
         ui.horizontal(|ui| {
             ui.spinner();
             ui.heading("Crawling");
-            ui.label(RichText::new(&crawl.url).weak());
+            ui.label(
+                RichText::new(format!(
+                    "#{} {}",
+                    crawl.session_id.unwrap_or(-1),
+                    crawl.url
+                ))
+                .weak(),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !crawl.stop_requested
                     && ui
@@ -1155,6 +1223,178 @@ fn live_view(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
     if stop_clicked {
         app.stop_crawl();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session stat rings
+// ---------------------------------------------------------------------------
+
+/// Circular gauges above the sheet tabs: green = good, yellow = mid, red =
+/// bad, with the value and a label inside each ring.
+fn stat_rings(app: &PeriscrawlApp, ui: &mut egui::Ui) {
+    if app.summaries.is_empty() {
+        return;
+    }
+    let total = app.summaries.len() as f32;
+    let ok_pages = app
+        .summaries
+        .iter()
+        .filter(|summary| summary.status.starts_with('2'))
+        .count() as f32;
+    let indexable = app
+        .summaries
+        .iter()
+        .filter(|summary| !summary.indexability.to_lowercase().contains("noindex"))
+        .count() as f32;
+
+    let (mut critical, mut warning, mut notice) = (0usize, 0usize, 0usize);
+    for finding in &app.findings {
+        match finding.severity {
+            IssueSeverity::Critical => critical += finding.count,
+            IssueSeverity::Warning => warning += finding.count,
+            IssueSeverity::Notice => notice += finding.count,
+        }
+    }
+
+    // Average PageSpeed score across sampled pages (desktop + mobile).
+    let mut cwv_sum = 0.0f32;
+    let mut cwv_count = 0usize;
+    for page in &app.pages {
+        for data in [page.cwv_desktop.as_ref(), page.cwv_mobile.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(score) = data.performance_score.trim().parse::<f32>() {
+                cwv_sum += score;
+                cwv_count += 1;
+            }
+        }
+    }
+
+    let ok_ratio = ok_pages / total;
+    let indexable_ratio = indexable / total;
+    ui.horizontal(|ui| {
+        ring(
+            ui,
+            ok_ratio,
+            &format!("{:.0}%", ok_ratio * 100.0),
+            "Pages OK",
+            ratio_color(ok_ratio, 0.95, 0.8),
+            &format!("{} of {} pages answered 2xx/3xx", ok_pages as usize, app.summaries.len()),
+        );
+        ring(
+            ui,
+            indexable_ratio,
+            &format!("{:.0}%", indexable_ratio * 100.0),
+            "Indexable",
+            ratio_color(indexable_ratio, 0.9, 0.6),
+            "Pages without a noindex directive (meta robots / header)",
+        );
+        ring(
+            ui,
+            (critical as f32 / 50.0).min(1.0),
+            &critical.to_string(),
+            "Critical",
+            if critical > 0 { ERR_RED } else { OK_GREEN },
+            "Critical issue occurrences (broken links, redirects to error, 404s…)",
+        );
+        ring(
+            ui,
+            (warning as f32 / 50.0).min(1.0),
+            &warning.to_string(),
+            "Warnings",
+            if warning > 0 { WARN_YELLOW } else { OK_GREEN },
+            "Warning-level issues (titles, descriptions, alt text, CWV…)",
+        );
+        ring(
+            ui,
+            (notice as f32 / 50.0).min(1.0),
+            &notice.to_string(),
+            "Notices",
+            if notice > 0 { Color32::from_gray(150) } else { OK_GREEN },
+            "Informational findings (length hints, non-critical polish)",
+        );
+        if cwv_count > 0 {
+            let average = cwv_sum / cwv_count as f32;
+            ring(
+                ui,
+                average / 100.0,
+                &format!("{average:.0}"),
+                "CWV score",
+                ratio_color(average / 100.0, 0.9, 0.5),
+                &format!("Average PageSpeed score across {cwv_count} sampled runs (desktop + mobile)"),
+            );
+        } else {
+            ring(
+                ui,
+                0.0,
+                "–",
+                "CWV score",
+                Color32::from_gray(110),
+                "No PageSpeed data in this session (enable the connector and re-crawl)",
+            );
+        }
+    });
+}
+
+fn ratio_color(ratio: f32, good: f32, mid: f32) -> Color32 {
+    if ratio >= good {
+        OK_GREEN
+    } else if ratio >= mid {
+        WARN_YELLOW
+    } else {
+        ERR_RED
+    }
+}
+
+/// One circular gauge: background ring, value arc, number + label inside.
+fn ring(
+    ui: &mut egui::Ui,
+    fraction: f32,
+    big: &str,
+    label: &str,
+    color: Color32,
+    hover: &str,
+) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(80.0, 80.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let center = rect.center();
+    let radius = 29.0;
+    let thickness = 7.0;
+    let painter = ui.painter();
+    painter.circle_stroke(center, radius, egui::Stroke::new(thickness, Color32::from_gray(55)));
+
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction > 0.001 {
+        let segments = 48;
+        let points: Vec<egui::Pos2> = (0..=segments)
+            .map(|step| {
+                let t = step as f32 / segments as f32;
+                let angle = -std::f32::consts::FRAC_PI_2 + t * fraction * std::f32::consts::TAU;
+                center + egui::vec2(angle.cos(), angle.sin()) * radius
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(thickness, color)));
+    }
+
+    painter.text(
+        center + egui::vec2(0.0, -5.0),
+        egui::Align2::CENTER_CENTER,
+        big,
+        egui::FontId::proportional(17.0),
+        Color32::WHITE,
+    );
+    painter.text(
+        center + egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(10.0),
+        Color32::from_gray(170),
+    );
+
+    response.on_hover_text(hover);
 }
 
 // ---------------------------------------------------------------------------

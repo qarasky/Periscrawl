@@ -990,6 +990,16 @@ async fn crawl(args: CrawlArgs) -> anyhow::Result<ExitCode> {
         )?;
     }
 
+    // PageSpeed results are collected by background workers (so they never
+    // slow the crawl itself); a one-shot CLI run waits for them so its output
+    // and exports are complete.
+    if !no_db {
+        if !quiet && !json_events {
+            println!("Waiting for PageSpeed results…");
+        }
+        engine.wait_for_psi_drain().await;
+    }
+
     let stats = engine.stats();
     let robots_blocked = stats.robots_blocked();
     let js_renders = stats.js_renders();
@@ -1228,22 +1238,44 @@ async fn status_command(json_output: bool) -> anyhow::Result<ExitCode> {
                     serde_json::to_string_pretty(&json!({ "server": true, "status": status }))?
                 );
             } else if status["running"].as_bool() == Some(true) {
-                println!(
-                    "Crawling {} — {} pages, {} failed, queued {}, processing {} • {:.0}s{}",
-                    status["url"].as_str().unwrap_or(""),
-                    status["pages"].as_u64().unwrap_or(0),
-                    status["failed"].as_u64().unwrap_or(0),
-                    status["queued"].as_u64().unwrap_or(0),
-                    status["processing"].as_u64().unwrap_or(0),
-                    status["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0,
-                    if status["stop_requested"].as_bool() == Some(true) {
-                        " (stopping…)"
-                    } else {
-                        ""
+                let crawls = status["crawls"].as_array().cloned().unwrap_or_default();
+                if crawls.is_empty() {
+                    println!(
+                        "Crawling {} — {} pages, {} failed, queued {}, processing {} • {:.0}s{}",
+                        status["url"].as_str().unwrap_or(""),
+                        status["pages"].as_u64().unwrap_or(0),
+                        status["failed"].as_u64().unwrap_or(0),
+                        status["queued"].as_u64().unwrap_or(0),
+                        status["processing"].as_u64().unwrap_or(0),
+                        status["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0,
+                        if status["stop_requested"].as_bool() == Some(true) {
+                            " (stopping…)"
+                        } else {
+                            ""
+                        }
+                    );
+                    if let Some(sid) = status["session_id"].as_i64() {
+                        println!("  session: {sid}");
                     }
-                );
-                if let Some(sid) = status["session_id"].as_i64() {
-                    println!("  session: {sid}");
+                } else {
+                    println!("{} crawl(s) running:", crawls.len());
+                    for crawl in &crawls {
+                        println!(
+                            "  [session {}] {} — {} pages, {} failed, queued {}, processing {} • {:.0}s{}",
+                            crawl["session_id"].as_i64().unwrap_or(-1),
+                            crawl["url"].as_str().unwrap_or(""),
+                            crawl["pages"].as_u64().unwrap_or(0),
+                            crawl["failed"].as_u64().unwrap_or(0),
+                            crawl["queued"].as_u64().unwrap_or(0),
+                            crawl["processing"].as_u64().unwrap_or(0),
+                            crawl["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0,
+                            if crawl["stop_requested"].as_bool() == Some(true) {
+                                " (stopping…)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
                 }
             } else {
                 println!("Sync server is running; no crawl is active.");
@@ -1351,8 +1383,9 @@ async fn stop_command() -> anyhow::Result<ExitCode> {
         .request("crawl.stop", json!({}))
         .await
         .map_err(anyhow::Error::msg)?;
-    if result["stopped"].as_bool() == Some(true) {
-        println!("Stop requested; the crawl will end after in-flight requests finish.");
+    let stopped = result["stopped"].as_u64().unwrap_or(0);
+    if stopped > 0 {
+        println!("Stop requested for {stopped} crawl(s); in-flight requests are aborted immediately.");
     } else {
         println!("No crawl is running.");
     }

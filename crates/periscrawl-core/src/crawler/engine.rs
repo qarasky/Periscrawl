@@ -32,6 +32,11 @@ pub struct CrawlEngine {
     pagespeed_config: Option<crate::models::PageSpeedConfig>,
     /// Per-run PageSpeed sampling state (nav pages + one per template).
     psi_sampler: Arc<crate::crawler::helpers::psi::PsiSampler>,
+    /// Permit pool bounding concurrent background PSI requests.
+    psi_semaphore: Arc<Semaphore>,
+    /// Dedicated client for PSI: the API can take up to a minute, so it gets
+    /// a much longer timeout than crawl requests.
+    psi_client: Client,
     enable_db_persist: bool,
     pending_pages: Arc<Mutex<Vec<PageData>>>,
     db_batch_size: usize,
@@ -110,6 +115,13 @@ impl CrawlEngine {
             browser: None,
             pagespeed_config: None,
             psi_sampler: Arc::new(crate::crawler::helpers::psi::PsiSampler::new()),
+            psi_semaphore: Arc::new(Semaphore::new(
+                crate::crawler::helpers::psi::DEFAULT_CONCURRENCY,
+            )),
+            psi_client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .unwrap_or_default(),
             enable_db_persist: false,
             pending_pages: Arc::new(Mutex::new(Vec::with_capacity(db_batch_size))),
             db_batch_size,
@@ -167,6 +179,52 @@ impl CrawlEngine {
             "unlimited".to_string()
         } else {
             self.max_pages.to_string()
+        }
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// PageSpeed context for one fetch (None when PSI is off for this run).
+    fn psi_ref(&self) -> Option<crate::crawler::fetching::PsiRef<'_>> {
+        let config = self.pagespeed_config.as_ref()?;
+        if !config.status || config.api_key.is_empty() {
+            return None;
+        }
+        Some(crate::crawler::fetching::PsiRef {
+            config,
+            sampler: &self.psi_sampler,
+            semaphore: &self.psi_semaphore,
+            client: &self.psi_client,
+            session_id: self.session_id,
+        })
+    }
+
+    /// Wait until background PageSpeed work for this engine has finished.
+    /// One-shot CLI crawls call this so their output includes the CWV data;
+    /// the server/GUI does not call it, so sessions complete the moment pages
+    /// are done and CWV results land in the database in the background.
+    pub async fn wait_for_psi_drain(&self) {
+        let active = self
+            .pagespeed_config
+            .as_ref()
+            .is_some_and(|config| config.status && !config.api_key.is_empty());
+        if !active {
+            return;
+        }
+        let permits = crate::crawler::helpers::psi::DEFAULT_CONCURRENCY as u32;
+        let semaphore = self.psi_semaphore.clone();
+        if tokio::time::timeout(
+            Duration::from_secs(20 * 60),
+            semaphore.acquire_many_owned(permits),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("[CWV] Timed out waiting for PageSpeed results");
         }
     }
 
@@ -250,6 +308,9 @@ impl CrawlEngine {
         // Continue page ids after the highest stored id so resumed pages can
         // never overwrite already-persisted rows of the same session.
         self.id_base = pages.iter().map(|page| page.id).max().unwrap_or(0);
+        // Same session: earlier runs already spent PSI samples — don't repeat
+        // them on resume.
+        self.psi_sampler.seed_from_pages(&pages);
         self.resume_pages = Some(Arc::new(pages));
         self
     }
@@ -257,7 +318,10 @@ impl CrawlEngine {
     /// Re-crawl incrementally: pages from a previous session provide
     /// ETag / Last-Modified validators, and 304 responses reuse that stored
     /// content instead of re-downloading it.
-    pub fn with_incremental_baseline(mut self, pages: Vec<PageData>) -> Self {        let mut baseline: HashMap<String, PageData> = HashMap::with_capacity(pages.len());
+    pub fn with_incremental_baseline(mut self, pages: Vec<PageData>) -> Self {
+        // Incremental re-crawls reuse the same session's samples too.
+        self.psi_sampler.seed_from_pages(&pages);
+        let mut baseline: HashMap<String, PageData> = HashMap::with_capacity(pages.len());
         for page in pages {
             if !page.requested_url.is_empty() {
                 let requested =
@@ -493,12 +557,7 @@ impl CrawlEngine {
         while !queue.is_empty() || !join_set.is_empty() {
             // Fill up our concurrency quota
             while !queue.is_empty() && join_set.len() < self.concurrency_limit {
-                if self.budget_reached(spawned)
-                    || self
-                        .stop_flag
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                {
+                if self.budget_reached(spawned) || self.stop_requested() {
                     break;
                 }
 
@@ -533,12 +592,12 @@ impl CrawlEngine {
                         .as_ref()
                         .and_then(|baseline| baseline.get(&normalized_url))
                         .and_then(validators_from);
+                    let psi_ref = engine.psi_ref();
                     let result = match fetch_and_process(
                         &engine.client,
                         &engine.browser,
                         &engine.user_agents,
-                        &engine.pagespeed_config,
-                        Some(engine.psi_sampler.as_ref()),
+                        psi_ref.as_ref(),
                         engine.enable_javascript,
                         engine.js_fallback,
                         validators.as_ref(),
@@ -580,8 +639,27 @@ impl CrawlEngine {
                 });
             }
 
-            // Wait for at least one task to complete
-            if let Some(res) = join_set.join_next().await {
+            // Wait for at least one task to complete. The short tick lets a
+            // stop request abort in-flight requests *immediately* instead of
+            // waiting for the slowest request (or a PSI call) to finish.
+            let next = tokio::select! {
+                result = join_set.join_next() => result,
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                    if self.stop_requested() {
+                        let aborted = join_set.len();
+                        if aborted > 0 {
+                            tracing::warn!(
+                                "[STOP] Aborting {} in-flight request(s) immediately",
+                                aborted
+                            );
+                        }
+                        join_set.abort_all();
+                        queue.clear();
+                    }
+                    continue;
+                }
+            };
+            if let Some(res) = next {
                 match res {
                     Ok(Ok(mut data)) => {
                         // Redirects mean the URL we queued (data.requested_url) and the
@@ -761,19 +839,20 @@ impl CrawlEngine {
                         tracing::error!("Crawl Error: {}", e);
                     }
                     Err(e) => {
-                        self.stats.increment_failed();
-                        tracing::error!("Task Panic/Error: {}", e);
+                        if e.is_cancelled() {
+                            tracing::debug!("[STOP] Fetch task cancelled by stop request");
+                        } else {
+                            self.stats.increment_failed();
+                            tracing::error!("Task Panic/Error: {}", e);
+                        }
                     }
                 }
             }
 
             // Reached the page budget (or asked to stop): stop spawning new
-            // fetches; just drain the tasks that are already in flight.
-            let stop_requested = self
-                .stop_flag
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed));
-            if self.budget_reached(spawned) || stop_requested {
+            // fetches. On stop, the wait loop above has already aborted any
+            // in-flight tasks — nothing left to drain.
+            if self.budget_reached(spawned) || self.stop_requested() {
                 queue.clear();
             }
 

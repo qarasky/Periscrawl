@@ -170,7 +170,10 @@ pub struct PeriscrawlApp {
     pub status_tx: Sender<String>,
     status_rx: Receiver<String>,
     pub form: CrawlForm,
-    pub crawl: Option<LiveCrawl>,
+    /// Live crawls keyed by session id. Any number can run in parallel.
+    pub crawls: HashMap<i64, LiveCrawl>,
+    /// Which running crawl the live view shows (and the Stop button stops).
+    pub crawl_focus: Option<i64>,
     pub diff_with: Option<i64>,
     pub diff_entries: Vec<DiffEntry>,
     pub diff_stats: Option<DiffStats>,
@@ -183,6 +186,13 @@ pub struct PeriscrawlApp {
     pub detail_width: f32,
     /// Last rendered rect of the details pane (for the grip overlay).
     pub detail_rect: Option<egui::Rect>,
+    /// Text to place on the clipboard on the next frame (egui owns the
+    /// clipboard, so it is applied during drawing).
+    pub pending_clipboard: Option<String>,
+    /// Automation hook: `PERISCRAWL_GUI_EXPORT_AI=1` runs the AI prompt
+    /// export once after the initial session load (scriptable headless-ish
+    /// usage, mirrors PERISCRAWL_GUI_OPEN_SESSION).
+    export_ai_on_load: bool,
 }
 
 impl PeriscrawlApp {
@@ -257,7 +267,8 @@ impl PeriscrawlApp {
                 concurrency: settings.crawler.concurrency,
                 javascript: settings.crawler.enable_javascript,
             },
-            crawl: None,
+            crawls: HashMap::new(),
+            crawl_focus: None,
             diff_with: None,
             diff_entries: Vec::new(),
             diff_stats: None,
@@ -268,6 +279,10 @@ impl PeriscrawlApp {
             log_path,
             detail_width: 540.0,
             detail_rect: None,
+            pending_clipboard: None,
+            export_ai_on_load: std::env::var("PERISCRAWL_GUI_EXPORT_AI")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         };
         app.refresh_sessions();
         // Testing/automation hook: auto-open a session, e.g.
@@ -314,9 +329,6 @@ impl PeriscrawlApp {
     }
 
     pub fn start_crawl(&mut self) {
-        if self.crawl.is_some() {
-            return;
-        }
         let raw = self.form.url.trim();
         if raw.is_empty() {
             self.status = "Enter a URL first".to_string();
@@ -349,8 +361,16 @@ impl PeriscrawlApp {
 
         match self.runtime.block_on(self.service.start_crawl(options)) {
             Ok(session_id) => {
-                self.crawl = Some(LiveCrawl::new(url, Some(session_id)));
-                self.status = "Crawl started".to_string();
+                self.crawls
+                    .insert(session_id, LiveCrawl::new(url, Some(session_id)));
+                self.crawl_focus = Some(session_id);
+                let running = self.crawls.len();
+                self.status = if running > 1 {
+                    format!("Crawl started ({running} running in parallel)")
+                } else {
+                    "Crawl started".to_string()
+                };
+                self.refresh_sessions();
             }
             Err(err) => {
                 self.status = format!("Could not start crawl: {err}");
@@ -358,9 +378,29 @@ impl PeriscrawlApp {
         }
     }
 
+    /// The crawl currently shown in the live view (newest if unset).
+    pub fn focused_crawl(&self) -> Option<&LiveCrawl> {
+        self.crawl_focus
+            .and_then(|id| self.crawls.get(&id))
+            .or_else(|| self.crawls.values().max_by_key(|crawl| crawl.started))
+    }
+
+    /// Session ids of running crawls, oldest first (for the sidebar spinner
+    /// list and the live-view selector).
+    pub fn running_sessions(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self.crawls.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Stop the focused crawl only; other parallel crawls keep running.
     pub fn stop_crawl(&mut self) {
-        if self.service.stop() {
-            self.status = "Stop requested; finishing in-flight requests…".to_string();
+        let target = self.crawl_focus.or_else(|| self.crawls.keys().copied().min());
+        if let Some(session_id) = target {
+            if self.service.stop_session(session_id) {
+                self.status =
+                    format!("Stop requested for session {session_id}; aborting in-flight requests");
+            }
         }
     }
 
@@ -525,6 +565,64 @@ impl PeriscrawlApp {
         self.status = "Exporting…".to_string();
     }
 
+    /// "Export prompt (AI)" — writes the Overview sheet as CSV into the
+    /// user's Documents folder and returns the path plus a short prompt
+    /// explaining the file (the caller copies it to the clipboard).
+    pub fn export_ai_prompt(&mut self) -> Result<(std::path::PathBuf, String), String> {
+        let Some(sid) = self.selected_session else {
+            return Err("no session selected".to_string());
+        };
+        let Some(sheet) = self
+            .sheets
+            .iter()
+            .find(|sheet| sheet.name == "Overview")
+            .or_else(|| self.sheets.first())
+        else {
+            return Err("nothing to export yet".to_string());
+        };
+        let session = db::get_session(sid)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("session {sid} not found"))?;
+
+        let csv = export::sheet_to_csv(sheet);
+        let label_source = session
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                url::Url::parse(&session.start_url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(|host| host.to_string()))
+            })
+            .unwrap_or_else(|| format!("session{sid}"));
+        let label: String = label_source
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let dir = export::documents_dir().map_err(|err| err.to_string())?;
+        let path = dir.join(format!("periscrawl_{label}_{date}.csv"));
+        std::fs::write(&path, csv)
+            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+
+        let prompt = format!(
+            "This CSV is an SEO audit export from Periscrawl: one row per crawled page of {site} ({pages} pages, crawled {date}) with HTTP status, title/description lengths, word count, indexability, and internal/external/image link counts. Absolute path: {path}. If this repository contains the source code of {site} and the crawl is relevant to it, consider copying the file into the repository's docs folder alongside the code.",
+            site = session.start_url,
+            pages = session.pages_fetched,
+            path = path.display(),
+        );
+        self.pending_clipboard = Some(prompt.clone());
+        self.status = format!("AI prompt copied; CSV written to {}", path.display());
+        Ok((path, prompt))
+    }
+
     /// Drain background channels. Called once per frame before drawing.
     pub fn poll_events(&mut self) {
         while let Ok(message) = self.status_rx.try_recv() {
@@ -551,6 +649,12 @@ impl PeriscrawlApp {
                         "Loaded session {} ({} stored pages)",
                         loaded.session_id, loaded.page_count
                     );
+                    if self.export_ai_on_load {
+                        self.export_ai_on_load = false;
+                        if let Err(err) = self.export_ai_prompt() {
+                            self.status = format!("AI export failed: {err}");
+                        }
+                    }
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
@@ -582,8 +686,8 @@ impl PeriscrawlApp {
             }
         }
 
-        // Live crawl events from the shared service (ours or an external one).
-        let mut ended: Option<Value> = None;
+        // Live crawl events from the shared service (ours or external ones).
+        let mut ended_events: Vec<Value> = Vec::new();
         loop {
             match self.events.try_recv() {
                 Ok(event) => {
@@ -592,34 +696,48 @@ impl PeriscrawlApp {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
+                    let session_id = event.get("session_id").and_then(Value::as_i64);
                     match name.as_str() {
                         "crawl.start" => {
-                            if self.crawl.is_none() {
-                                let url = event["url"].as_str().unwrap_or("").to_string();
-                                let session_id = event["session_id"].as_i64();
-                                self.crawl = Some(LiveCrawl::new(url, session_id));
-                                self.status = "External crawl started — watching live".to_string();
-                            }
-                        }
-                        "page" => {
-                            if let Some(crawl) = &mut self.crawl {
-                                let status = event["status"].as_str().unwrap_or("").to_string();
-                                let code = status.get(..3).and_then(|c| c.parse::<u16>().ok());
-                                let failed = code.is_none_or(|c| c >= 400);
-                                crawl.recent.push(LivePage {
-                                    status,
-                                    url: event["url"].as_str().unwrap_or("").to_string(),
-                                    links: event["links"].as_u64().unwrap_or(0) as usize,
-                                    failed,
-                                    not_modified: event["not_modified"].as_bool() == Some(true),
-                                    js_rendered: event["js_rendered"].as_bool() == Some(true),
-                                });
-                                if crawl.recent.len() > 500 {
-                                    crawl.recent.remove(0);
+                            if let Some(sid) = session_id {
+                                if !self.crawls.contains_key(&sid) {
+                                    let url =
+                                        event["url"].as_str().unwrap_or("").to_string();
+                                    self.crawls.insert(sid, LiveCrawl::new(url, Some(sid)));
+                                    if self.crawl_focus.is_none() {
+                                        self.crawl_focus = Some(sid);
+                                    }
+                                    self.status = format!(
+                                        "External crawl started (session {sid}) — watching live"
+                                    );
+                                    self.refresh_sessions();
                                 }
                             }
                         }
-                        "crawl.end" => ended = Some(event),
+                        "page" => {
+                            if let Some(sid) = session_id {
+                                if let Some(crawl) = self.crawls.get_mut(&sid) {
+                                    let status =
+                                        event["status"].as_str().unwrap_or("").to_string();
+                                    let code =
+                                        status.get(..3).and_then(|c| c.parse::<u16>().ok());
+                                    let failed = code.is_none_or(|c| c >= 400);
+                                    crawl.recent.push(LivePage {
+                                        status,
+                                        url: event["url"].as_str().unwrap_or("").to_string(),
+                                        links: event["links"].as_u64().unwrap_or(0) as usize,
+                                        failed,
+                                        not_modified: event["not_modified"].as_bool()
+                                            == Some(true),
+                                        js_rendered: event["js_rendered"].as_bool() == Some(true),
+                                    });
+                                    if crawl.recent.len() > 500 {
+                                        crawl.recent.remove(0);
+                                    }
+                                }
+                            }
+                        }
+                        "crawl.end" => ended_events.push(event),
                         _ => {}
                     }
                 }
@@ -629,43 +747,73 @@ impl PeriscrawlApp {
             }
         }
 
-        // Keep live counters fresh from the service; treat a stopped service as
-        // crawl completion even if the end event was missed.
-        if let Some(crawl) = &mut self.crawl {
-            let status = self.service.status();
-            crawl.pages = status.pages;
-            crawl.failed = status.failed;
-            crawl.queued = status.queued;
-            crawl.processing = status.processing;
-            crawl.robots_blocked = status.robots_blocked;
-            crawl.js_renders = status.js_renders;
-            crawl.not_modified = status.not_modified;
-            crawl.stop_requested = status.stop_requested;
-            if !status.running && ended.is_none() {
-                ended = Some(Value::Null);
+        // Keep live counters fresh for every crawl; anything the service no
+        // longer reports has ended (even if its end event was missed).
+        let statuses = self.service.status().crawls;
+        for status in &statuses {
+            if let Some(crawl) = self.crawls.get_mut(&status.session_id) {
+                crawl.pages = status.pages;
+                crawl.failed = status.failed;
+                crawl.queued = status.queued;
+                crawl.processing = status.processing;
+                crawl.robots_blocked = status.robots_blocked;
+                crawl.js_renders = status.js_renders;
+                crawl.not_modified = status.not_modified;
+                crawl.stop_requested = status.stop_requested;
             }
         }
+        let running_ids: Vec<i64> = statuses.iter().map(|status| status.session_id).collect();
+        let vanished: Vec<i64> = self
+            .crawls
+            .keys()
+            .filter(|id| !running_ids.contains(id))
+            .copied()
+            .collect();
+        for session_id in vanished {
+            ended_events.push(serde_json::json!({ "session_id": session_id }));
+        }
 
-        if let Some(event) = ended {
-            let session_id = event
-                .get("session_id")
-                .and_then(Value::as_i64)
-                .or_else(|| self.crawl.as_ref().and_then(|c| c.session_id));
-            let pages = event
-                .get("pages")
-                .and_then(Value::as_u64)
-                .map(|p| p as usize)
-                .or_else(|| self.crawl.as_ref().map(|c| c.pages))
-                .unwrap_or(0);
-            let outcome = event
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("completed")
-                .to_string();
-            self.crawl = None;
+        if !ended_events.is_empty() {
+            let mut last_session: Option<i64> = None;
+            let mut outcome = "completed".to_string();
+            let mut pages = 0usize;
+            for event in &ended_events {
+                let Some(sid) = event.get("session_id").and_then(Value::as_i64) else {
+                    continue;
+                };
+                pages = event
+                    .get("pages")
+                    .and_then(Value::as_u64)
+                    .map(|p| p as usize)
+                    .or_else(|| self.crawls.get(&sid).map(|crawl| crawl.pages))
+                    .unwrap_or(0);
+                outcome = event
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("completed")
+                    .to_string();
+                self.crawls.remove(&sid);
+                last_session = Some(sid);
+            }
+            if self
+                .crawl_focus
+                .is_some_and(|focus| !self.crawls.contains_key(&focus))
+            {
+                self.crawl_focus = self
+                    .crawls
+                    .values()
+                    .max_by_key(|crawl| crawl.started)
+                    .and_then(|crawl| crawl.session_id);
+            }
             self.refresh_sessions();
-            self.status = format!("Crawl {outcome}: {pages} pages");
-            if let Some(id) = session_id {
+            let remaining = self.crawls.len();
+            let suffix = if remaining > 0 {
+                format!(" ({remaining} still running)")
+            } else {
+                String::new()
+            };
+            self.status = format!("Crawl {outcome}: {pages} pages{suffix}");
+            if let Some(id) = last_session {
                 self.load_session(id);
             }
         }
@@ -675,7 +823,7 @@ impl PeriscrawlApp {
 impl eframe::App for PeriscrawlApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
-        if self.crawl.is_some() || self.loading_session || self.diff_loading {
+        if !self.crawls.is_empty() || self.loading_session || self.diff_loading {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
