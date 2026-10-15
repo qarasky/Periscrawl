@@ -296,6 +296,12 @@ enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Delete the session and every page stored for it.
+    Delete {
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -1741,6 +1747,27 @@ fn session_command(id: i64, action: SessionAction) -> anyhow::Result<ExitCode> {
                     println!("  No issues detected.");
                 }
             }
+        }
+        SessionAction::Delete { yes } => {
+            use std::io::IsTerminal;
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    eprintln!("error: refusing to delete without --yes (no terminal to confirm on)");
+                    return Ok(ExitCode::FAILURE);
+                }
+                eprint!("Delete session {id} and all its stored pages? [y/N] ");
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                let answer = answer.trim().to_lowercase();
+                if answer != "y" && answer != "yes" {
+                    println!("Aborted.");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+            let pages = db::delete_session(id)?;
+            println!("Deleted session {id} ({pages} stored pages removed).");
         }
     }
     Ok(ExitCode::SUCCESS)

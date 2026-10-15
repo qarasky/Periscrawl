@@ -314,6 +314,17 @@ pub fn load_session_pages(session_id: i64) -> SqliteResult<Vec<PageData>> {
     Ok(rows)
 }
 
+/// Delete a session and every page stored for it. Returns the number of page
+/// rows removed. Used by the GUI's per-row remove button and
+/// `periscrawl session <id> delete`.
+pub fn delete_session(session_id: i64) -> SqliteResult<usize> {
+    let conn = Connection::open(get_db_path())?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    let pages_deleted = conn.execute("DELETE FROM pages WHERE session_id = ?1", [session_id])?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+    Ok(pages_deleted)
+}
+
 /// Store PageSpeed results for an already-persisted page. Background CWV
 /// workers call this after the crawl has moved on (and sometimes after the
 /// session is marked finished), so it tolerates racing the crawl's own

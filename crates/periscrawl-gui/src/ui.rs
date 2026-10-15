@@ -200,6 +200,7 @@ fn left_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
             ui.add_space(2.0);
 
             let mut clicked: Option<i64> = None;
+            let mut remove_clicked: Option<i64> = None;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -236,6 +237,29 @@ fn left_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
                             {
                                 clicked = Some(session.id);
                             }
+                            let pending = app.pending_session_delete == Some(session.id);
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let label = if pending {
+                                    RichText::new("✕ sure?").color(ERR_RED).small()
+                                } else {
+                                    RichText::new("✕").weak().small()
+                                };
+                                let hover = if crawling {
+                                    "Stop the crawl before removing this session".to_string()
+                                } else if pending {
+                                    "Click again to delete this session and its stored pages"
+                                        .to_string()
+                                } else {
+                                    format!("Remove session #{} (asks to confirm)", session.id)
+                                };
+                                if ui
+                                    .add(egui::Button::new(label).frame(false))
+                                    .on_hover_text(hover)
+                                    .clicked()
+                                {
+                                    remove_clicked = Some(session.id);
+                                }
+                            });
                         });
                         ui.label(
                             RichText::new(format!(
@@ -250,6 +274,16 @@ fn left_panel(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
                 });
             if let Some(id) = clicked {
                 app.load_session(id);
+            }
+            if let Some(id) = remove_clicked {
+                if app.pending_session_delete == Some(id) {
+                    app.delete_session(id);
+                } else if app.crawls.contains_key(&id) {
+                    app.status = format!("Session {id} is crawling — stop it first");
+                } else {
+                    app.pending_session_delete = Some(id);
+                    app.status = format!("Click ✕ again to delete session {id}");
+                }
             }
         });
 }

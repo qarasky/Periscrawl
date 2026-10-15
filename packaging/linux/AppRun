@@ -1,0 +1,6 @@
+#!/bin/sh
+# AppImage entry point: run the desktop app (CLI lives in usr/bin for
+# terminals or extracted use).
+set -e
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/periscrawl-gui" "$@"

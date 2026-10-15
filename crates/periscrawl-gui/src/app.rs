@@ -186,6 +186,8 @@ pub struct PeriscrawlApp {
     pub detail_width: f32,
     /// Last rendered rect of the details pane (for the grip overlay).
     pub detail_rect: Option<egui::Rect>,
+    /// Session whose remove button is awaiting a confirming second click.
+    pub pending_session_delete: Option<i64>,
     /// Text to place on the clipboard on the next frame (egui owns the
     /// clipboard, so it is applied during drawing).
     pub pending_clipboard: Option<String>,
@@ -279,6 +281,7 @@ impl PeriscrawlApp {
             log_path,
             detail_width: 540.0,
             detail_rect: None,
+            pending_session_delete: None,
             pending_clipboard: None,
             export_ai_on_load: std::env::var("PERISCRAWL_GUI_EXPORT_AI")
                 .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -404,10 +407,41 @@ impl PeriscrawlApp {
         }
     }
 
+    /// Delete a session from disk (the row's ✕ button; a second click
+    /// confirms). Running crawls cannot be deleted while they are active.
+    pub fn delete_session(&mut self, id: i64) {
+        if self.crawls.contains_key(&id) {
+            self.pending_session_delete = None;
+            self.status = format!("Session {id} is crawling — stop it before deleting");
+            return;
+        }
+        match db::delete_session(id) {
+            Ok(pages) => {
+                self.pending_session_delete = None;
+                if self.selected_session == Some(id) {
+                    self.selected_session = None;
+                    self.sheets.clear();
+                    self.pages.clear();
+                    self.summaries.clear();
+                    self.findings.clear();
+                    self.page_lookup.clear();
+                    self.detail = None;
+                }
+                self.refresh_sessions();
+                self.status = format!("Deleted session {id} ({pages} stored pages removed)");
+            }
+            Err(err) => {
+                self.pending_session_delete = None;
+                self.status = format!("Could not delete session {id}: {err}");
+            }
+        }
+    }
+
     pub fn load_session(&mut self, id: i64) {
         if self.loading_session {
             return;
         }
+        self.pending_session_delete = None;
         self.selected_session = Some(id);
         self.loading_session = true;
         self.sheets.clear();

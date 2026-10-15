@@ -1,0 +1,133 @@
+name: Release installers
+
+# Builds unsigned installers for all three platforms and attaches them to a
+# GitHub Release. Trigger by pushing a version tag (v0.3.0 → version 0.3.0)
+# or run manually with an explicit version.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for the artifacts (e.g. 0.2.0)"
+        default: "0.2.0"
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: macos
+          - os: windows-latest
+            artifact: windows
+          - os: ubuntu-22.04
+            artifact: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.version }}"
+            V="${V:-0.2.0}"
+          fi
+          echo "PERISCRAWL_VERSION=$V" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------- macOS
+      - name: macOS toolchain targets (universal2)
+        if: matrix.artifact == 'macos'
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: macOS package (.app + .dmg)
+        if: matrix.artifact == 'macos'
+        env:
+          PERISCRAWL_CARGO_TARGET: universal2
+        run: ./scripts/package-macos.sh
+
+      # ---------------------------------------------------------------- Linux
+      - name: Linux system dependencies (egui / winit)
+        if: matrix.artifact == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libgl1-mesa-dev
+
+      - name: Linux appimagetool
+        if: matrix.artifact == 'linux'
+        run: |
+          curl -L --fail -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+          echo "APPIMAGETOOL=$PWD/appimagetool" >> "$GITHUB_ENV"
+
+      - name: Linux package (tar.gz + AppImage)
+        if: matrix.artifact == 'linux'
+        run: ./scripts/package-linux.sh
+
+      # -------------------------------------------------------------- Windows
+      - name: Windows tooling (WiX v3 + NSIS)
+        if: matrix.artifact == 'windows'
+        shell: pwsh
+        run: |
+          curl.exe -L --fail -o wix.zip `
+            https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+          Expand-Archive wix.zip -DestinationPath wix -Force
+          echo "WIX_BIN=$($PWD.Path)\wix" >> $env:GITHUB_ENV
+          choco install nsis -y --no-progress
+          echo "NSIS_BIN=C:\Program Files (x86)\NSIS\makensis.exe" >> $env:GITHUB_ENV
+
+      - name: Windows package (zip + msi + setup exe)
+        if: matrix.artifact == 'windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+
+      # ---------------------------------------------------------------- upload
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: periscrawl-${{ matrix.artifact }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.msi
+            dist/*-setup.exe
+            dist/*.AppImage
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Show artifacts
+        run: ls -la artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false

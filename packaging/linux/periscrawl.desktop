@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Periscrawl
+Comment=Website crawler and SEO audit toolkit
+Exec=periscrawl-gui
+Icon=periscrawl
+Categories=Development;Utility;
+Terminal=false

@@ -1,27 +1,51 @@
 #!/usr/bin/env bash
-# Build a distributable macOS app bundle for Periscrawl.
+# Build the macOS deliverables for Periscrawl (unsigned / ad-hoc signed).
 #
 # Produces:
-#   dist/Periscrawl.app        — double-clickable desktop app (ad-hoc signed)
-#   dist/periscrawl            — the CLI binary
-#   dist/Periscrawl-macos.zip  — zipped bundle for sharing
+#   dist/Periscrawl.app             — double-clickable app bundle
+#   dist/Periscrawl-<version>.dmg   — disk image (app + /Applications link)
+#   dist/Periscrawl-macos.zip       — zipped app bundle
+#   dist/periscrawl                 — the CLI binary
+#
+# Environment:
+#   PERISCRAWL_VERSION       version string (default 0.2.0)
+#   PERISCRAWL_CARGO_TARGET  "universal2" builds both architectures and lipos
+#                            them together (what CI uses); any other value is
+#                            passed to `cargo build --target`
+#   PERISCRAWL_TARGET_DIR    cargo output dir for non-universal builds
+#                            (default target/release)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NAME="Periscrawl"
-VERSION="0.2.0"
+VERSION="${PERISCRAWL_VERSION:-0.2.0}"
+TARGET_DIR="${PERISCRAWL_TARGET_DIR:-target/release}"
 BUNDLE_ID="com.periscrawl.app"
 DIST="dist"
 APP="$DIST/$NAME.app"
 
 echo "==> Building release binaries"
-cargo build --release -p periscrawl-gui -p periscrawl-cli
+if [[ "${PERISCRAWL_CARGO_TARGET:-}" == "universal2" ]]; then
+    cargo build --release -p periscrawl-gui -p periscrawl-cli --target x86_64-apple-darwin
+    cargo build --release -p periscrawl-gui -p periscrawl-cli --target aarch64-apple-darwin
+    TARGET_DIR="target/universal2-release"
+    mkdir -p "$TARGET_DIR"
+    for bin in periscrawl-gui periscrawl; do
+        lipo -create -output "$TARGET_DIR/$bin" \
+            "target/x86_64-apple-darwin/release/$bin" \
+            "target/aarch64-apple-darwin/release/$bin"
+    done
+elif [[ -n "${PERISCRAWL_CARGO_TARGET:-}" ]]; then
+    cargo build --release -p periscrawl-gui -p periscrawl-cli --target "$PERISCRAWL_CARGO_TARGET"
+else
+    cargo build --release -p periscrawl-gui -p periscrawl-cli
+fi
 
 echo "==> Assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "target/release/periscrawl-gui" "$APP/Contents/MacOS/periscrawl-gui"
-cp "target/release/periscrawl" "$DIST/periscrawl" 2>/dev/null || true
+cp "$TARGET_DIR/periscrawl-gui" "$APP/Contents/MacOS/periscrawl-gui"
+cp "$TARGET_DIR/periscrawl" "$DIST/periscrawl" 2>/dev/null || true
 
 echo "==> Generating icon"
 python3 scripts/make_icon.py "$DIST/icon_1024.png"
@@ -64,11 +88,23 @@ echo "==> Zipping"
 rm -f "$DIST/$NAME-macos.zip"
 ditto -c -k --keepParent "$APP" "$DIST/$NAME-macos.zip"
 
+echo "==> Building DMG"
+DMG_STAGE="$DIST/dmg"
+DMG="$DIST/$NAME-$VERSION.dmg"
+rm -rf "$DMG_STAGE"
+mkdir -p "$DMG_STAGE"
+cp -R "$APP" "$DMG_STAGE/"
+ln -s /Applications "$DMG_STAGE/Applications"
+rm -f "$DMG"
+hdiutil create -volname "$NAME $VERSION" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$DMG_STAGE"
+
 echo
 echo "Done:"
 echo "  $APP"
 echo "  $DIST/periscrawl  (CLI)"
 echo "  $DIST/$NAME-macos.zip"
+echo "  $DMG"
 echo
-echo "Note: teammates opening the zip must allow it once (unsigned developer) —"
-echo "right-click → Open, or System Settings → Privacy & Security → Open Anyway."
+echo "Note: builds are unsigned — teammates opening the app must allow it once"
+echo "(right-click → Open, or System Settings → Privacy & Security → Open Anyway)."

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX v3 source for the Periscrawl MSI installer.
+  Built by scripts/package-windows.ps1 (or the release workflow) with:
+
+    candle.exe -dAppVersion=<version> -dDistDir=<abs dist path> periscrawl.wxs
+    light.exe  -out Periscrawl-<version>-x86_64.msi periscrawl.wixobj
+
+  The UpgradeCode is stable for the lifetime of the product so upgrades and
+  uninstalls are detected correctly. Do not change it.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Periscrawl"
+           Language="1033"
+           Version="$(var.AppVersion)"
+           Manufacturer="Periscrawl"
+           UpgradeCode="731C3CC5-AB59-4073-AC22-8EDEF456095E">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Periscrawl is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="Main" Title="Periscrawl" Level="1">
+      <ComponentRef Id="CliExe" />
+      <ComponentRef Id="GuiExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Periscrawl">
+          <Component Id="CliExe" Guid="8B4B6D3A-6C2C-4C46-9D0D-6B7B2A1C4E01">
+            <File Id="CliExeFile" Source="$(var.DistDir)\periscrawl.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="GuiExe" Guid="8B4B6D3A-6C2C-4C46-9D0D-6B7B2A1C4E02">
+            <File Id="GuiExeFile" Source="$(var.DistDir)\periscrawl-gui.exe" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="Periscrawl" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="StartMenuShortcut" Guid="8B4B6D3A-6C2C-4C46-9D0D-6B7B2A1C4E03">
+        <Shortcut Id="GuiStartMenu"
+                  Directory="ProgramMenuDir"
+                  Name="Periscrawl"
+                  Target="[INSTALLFOLDER]periscrawl-gui.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\Periscrawl" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Product>
+</Wix>

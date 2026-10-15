@@ -120,6 +120,12 @@ Rules:
       list every flagged item, one row per detail) in the GUI and exports
 - [x] Legacy AI chat removed end-to-end (GUI/TUI settings, chat modal, core
       Gemini/OpenAI clients) — AI analysis goes through "Export prompt (AI)"
+- [x] Session removal: per-row ✕ button in the GUI (two-click confirm, blocked
+      while crawling) + `periscrawl session <id> delete [--yes]`
+- [x] Release pipeline (.github/workflows/release.yml): unsigned installers on
+      tag/manual dispatch — macOS universal2 `.dmg`, Windows `.msi` (WiX v3) and
+      `-setup.exe` (NSIS), Linux `.AppImage` (+ tar.gz), attached to a GitHub
+      Release; `ci.yml` runs the workspace tests on pushes and PRs
 
 ## CLI conventions
 
