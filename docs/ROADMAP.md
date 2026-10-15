@@ -28,7 +28,7 @@ Rules:
 | CLI ↔ GUI sync | Shared SQLite (WAL) + local socket for live attach |
 | TUI | Kept as a workspace member, rebased on core |
 | Licensing | Reimplement inspiration from the GPL-3.0 reference app; no code copied |
-| AI chat | Not in v1 scope (code remains, no investment) |
+| AI chat | Removed — legacy TUI chat deleted along with the Gemini/OpenAI connectors |
 
 ## Phases
 
@@ -113,6 +113,13 @@ Rules:
 - [x] PageSpeed Insights sampling (nav pages + one per URL template):
       a 300-page audit collects CWV with ~38 API calls instead of 600
 - [x] `--max-pages 0` = crawl everything until stopped or the frontier is exhausted
+- [x] Platform-artifact filter: Cloudflare `/cdn-cgi/` URLs (email-protection,
+      rocket-loader scripts) are never crawled, flagged, or listed — they are
+      injected by the CDN, not authored on the site
+- [x] Clickable stat rings + full per-severity tabs (Critical/Warnings/Notices
+      list every flagged item, one row per detail) in the GUI and exports
+- [x] Legacy AI chat removed end-to-end (GUI/TUI settings, chat modal, core
+      Gemini/OpenAI clients) — AI analysis goes through "Export prompt (AI)"
 
 ## CLI conventions
 
@@ -125,9 +132,6 @@ Rules:
 
 - `Ctrl+I` URL entry is unreachable on macOS/Linux (terminal sends plain `Tab`);
   needs a rebind in the TUI.
-- Cloudflare `cdn-cgi/l/email-protection` obfuscation links (scraped from
-  `mailto:` markup) inflate 404 / broken-link counts on Cloudflare sites;
-  consider a crawl filter.
 - PSI sampling uses the first crawled page as each template's representative;
   a "most linked / shortest URL" preference would pick better samples.
 - Windows and Linux packaging scripts have not been exercised on real machines.

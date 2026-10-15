@@ -9,61 +9,6 @@ impl App {
         self.show_logs = !self.show_logs;
     }
 
-    pub fn toggle_ai_modal(&mut self) {
-        self.show_ai_modal = !self.show_ai_modal;
-        if self.show_ai_modal {
-            self.sidebar_visible = false;
-            self.show_help = false;
-        }
-    }
-
-    pub async fn submit_ai_message(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.ai_input.trim().is_empty() {
-            return Ok(());
-        }
-
-        let user_msg = crate::models::ChatLog {
-            role: "user".to_string(),
-            content: self.ai_input.clone(),
-        };
-        self.ai_chat_history.push(user_msg);
-        let input = self.ai_input.clone();
-        self.ai_input.clear();
-
-        // Get AI response using Gemini
-        let settings = self.settings.as_ref().ok_or("Settings not loaded")?;
-
-        let response = match settings.provider.llm.to_lowercase().as_str() {
-            "gemini" => match periscrawl_core::ai::gemini::ask(&input, settings).await {
-                Ok(resp) => resp,
-                Err(e) => format!("Error: {}", e),
-            },
-            "openai" => match periscrawl_core::ai::openai::ask(&input, settings).await {
-                Ok(resp) => resp,
-                Err(e) => format!("Error: {}", e),
-            },
-            _ => return Err("Unsupported AI model".into()),
-        };
-
-        self.ai_chat_history.push(crate::models::ChatLog {
-            role: "assistant".to_string(),
-            content: response,
-        });
-
-        // Scroll to bottom
-        if !self.ai_chat_history.is_empty() {
-            self.ai_chat_state
-                .select(Some(self.ai_chat_history.len() - 1));
-        }
-
-        Ok(())
-    }
-
-    pub fn clear_ai_chat(&mut self) {
-        self.ai_chat_history.clear();
-        self.ai_chat_state.select(None);
-    }
-
     pub fn handle_issues_enter(&mut self) {
         if let Some(selected) = self.issues_table_state.selected() {
             if selected < self.issues_table_data.len() {

@@ -306,6 +306,11 @@ impl IssueAnalyzer {
     ) -> (usize, Vec<String>) {
         let mut broken = Vec::new();
         for link in internal_links {
+            // Cloudflare email-protection (and similar) targets are injected
+            // by the CDN, not authored links — never report them as broken.
+            if crate::crawler::url_normalizer::is_platform_artifact(&link.destination) {
+                continue;
+            }
             if let Some(status) = url_to_status.get(&link.destination)
                 && (status.starts_with('4') || status.starts_with('5'))
             {
@@ -765,7 +770,9 @@ impl IssueAnalyzer {
         let mut urls = Vec::new();
 
         for page in page_data {
-            if page.status.contains('5') {
+            if page.status.contains('5')
+                && !crate::crawler::url_normalizer::is_platform_artifact(&page.url)
+            {
                 urls.push(page.url.clone());
             }
         }
@@ -777,7 +784,9 @@ impl IssueAnalyzer {
         let mut urls = Vec::new();
 
         for page in page_data {
-            if page.status.contains('3') {
+            if page.status.contains('3')
+                && !crate::crawler::url_normalizer::is_platform_artifact(&page.url)
+            {
                 urls.push(page.url.clone());
             }
         }
@@ -788,7 +797,9 @@ impl IssueAnalyzer {
     pub fn analyze_404_errors(page_data: &[PageSummary]) -> (usize, Vec<String>) {
         let mut urls = Vec::new();
         for page in page_data {
-            if page.status == "404" || page.status.starts_with('4') {
+            if page.status.starts_with('4')
+                && !crate::crawler::url_normalizer::is_platform_artifact(&page.url)
+            {
                 urls.push(page.url.clone());
             }
         }
@@ -1317,5 +1328,44 @@ mod gating_tests {
         assert!(!IssueAnalyzer::is_content_issue(" 5XX Errors "));
         assert!(IssueAnalyzer::is_content_issue("Missing H1"));
         assert!(IssueAnalyzer::is_content_issue("Broken Internal Links"));
+    }
+
+    #[test]
+    fn cloudflare_email_protection_is_never_flagged() {
+        let mut artifact = page("404 Not Found", "text/html");
+        artifact.url = "https://site.kz/cdn-cgi/l/email-protection".to_string();
+        let mut real_404 = page("404 Not Found", "text/html");
+        real_404.url = "https://site.kz/missing-page".to_string();
+
+        let summaries = vec![artifact.summarize(None), real_404.summarize(None)];
+        let (count, urls) = IssueAnalyzer::analyze_404_errors(&summaries);
+        assert_eq!(count, 1);
+        assert!(urls[0].contains("missing-page"));
+
+        let links = vec![
+            crate::models::InternalLink {
+                id: 1,
+                source: "https://site.kz/".to_string(),
+                destination: "https://site.kz/cdn-cgi/l/email-protection".to_string(),
+                anchor: String::new(),
+                rel: String::new(),
+            },
+            crate::models::InternalLink {
+                id: 2,
+                source: "https://site.kz/".to_string(),
+                destination: "https://site.kz/gone".to_string(),
+                anchor: String::new(),
+                rel: String::new(),
+            },
+        ];
+        let mut statuses = std::collections::HashMap::new();
+        statuses.insert(
+            "https://site.kz/cdn-cgi/l/email-protection".to_string(),
+            "404 Not Found".to_string(),
+        );
+        statuses.insert("https://site.kz/gone".to_string(), "404 Not Found".to_string());
+        let (count, urls) = IssueAnalyzer::analyse_broken_internal_links(&links, &statuses);
+        assert_eq!(count, 1);
+        assert!(urls[0].contains("/gone"));
     }
 }

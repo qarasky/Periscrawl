@@ -432,7 +432,10 @@ async fn fetch_standard(
             crate::crawler::url_normalizer::normalize_url(abs.as_str())
                 .unwrap_or_else(|| abs.to_string())
         })
-        .filter(|url| seen_nav.insert(url.clone()))
+        .filter(|url| {
+            !crate::crawler::url_normalizer::is_platform_artifact(url)
+                && seen_nav.insert(url.clone())
+        })
         .collect();
 
     // Filter and normalize links to stay on same domain
@@ -585,7 +588,10 @@ async fn fetch_js(url: &str, base_url: &Url, browser: Arc<Browser>) -> Result<Pa
             crate::crawler::url_normalizer::normalize_url(abs.as_str())
                 .unwrap_or_else(|| abs.to_string())
         })
-        .filter(|url| seen_nav.insert(url.clone()))
+        .filter(|url| {
+            !crate::crawler::url_normalizer::is_platform_artifact(url)
+                && seen_nav.insert(url.clone())
+        })
         .collect();
 
     // Filter and normalize links...

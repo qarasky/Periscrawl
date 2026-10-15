@@ -28,8 +28,40 @@ pub fn normalize_url(url: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
+/// Platform-injected artifacts that are never real site content. Cloudflare's
+/// Email Address Obfuscation rewrites `mailto:`/email markup in the served
+/// HTML into `/cdn-cgi/l/email-protection#…` links (and Rocket Loader injects
+/// `/cdn-cgi/scripts/…`); the origin templates never contain them. They must
+/// never be crawled, flagged as 404s, or listed as site links.
+pub fn is_platform_artifact(url: &str) -> bool {
+    let path = if let Ok(parsed) = Url::parse(url) {
+        parsed.path().to_lowercase()
+    } else {
+        let without_scheme = url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(url);
+        let without_host = without_scheme
+            .split_once('/')
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        format!(
+            "/{}",
+            without_host.split(['?', '#']).next().unwrap_or("")
+        )
+        .to_lowercase()
+    };
+    let path = path.trim_end_matches('/');
+    path == "/cdn-cgi" || path.starts_with("/cdn-cgi/")
+}
+
 /// Checks if a URL should be crawled based on file extension and patterns
 pub fn should_crawl_url(url: &str) -> bool {
+    // Cloudflare (and similar) platform internals are never real content.
+    if is_platform_artifact(url) {
+        return false;
+    }
+
     let url_lower = url.to_lowercase();
 
     // Skip common non-HTML resources
@@ -144,6 +176,22 @@ mod tests {
         assert!(!should_crawl_url("https://example.com/image.jpg"));
         assert!(!should_crawl_url("mailto:test@example.com"));
         assert!(!should_crawl_url("https://example.com/style.css"));
+    }
+
+    #[test]
+    fn cloudflare_email_protection_is_not_content() {
+        // The exact shape Cloudflare serves on email-obfuscated sites.
+        let protection = "https://modernization.kz/cdn-cgi/l/email-protection";
+        assert!(is_platform_artifact(protection));
+        assert!(!should_crawl_url(protection));
+        assert!(is_platform_artifact(
+            "https://site.kz/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"
+        ));
+        assert!(is_platform_artifact("https://site.kz/cdn-cgi/"));
+        // Regular pages, including ones with "cdn" in the path, are fine.
+        assert!(!is_platform_artifact("https://site.kz/cdn-cgi-notes"));
+        assert!(!is_platform_artifact("https://cdn.site.kz/logo.png"));
+        assert!(should_crawl_url("https://site.kz/about/cdn-explained"));
     }
 
     #[test]

@@ -206,10 +206,6 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         tabs::logs::render(f, app, logs_area);
     }
 
-    if app.show_ai_modal {
-        modals::ai_chat::render(f, app);
-    }
-
     if app.show_js_pages_modal {
         modals::js_pages::render(f, app);
     }

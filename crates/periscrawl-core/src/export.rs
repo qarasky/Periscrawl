@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use rust_xlsxwriter::{Format, Workbook};
 
 use crate::crawler::PageData;
-use crate::helpers::issues::IssueAnalyzer;
+use crate::helpers::issues::{IssueAnalyzer, IssueFinding, IssueSeverity};
 
 /// One exportable table. Column order in `header` matches every row.
 #[derive(Debug, Clone)]
@@ -45,10 +45,13 @@ pub fn exports_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// All report sheets for a crawl: data tabs first, issue audit last.
+/// All report sheets for a crawl: data tabs first, the issue audit plus
+/// per-severity detail tabs last. One analysis pass feeds all issue sheets.
 pub fn build_report_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec<Sheet> {
     let mut sheets = session_sheets(pages, base_domain);
-    sheets.push(issues_sheet(pages, base_domain));
+    let findings = IssueAnalyzer::analyze_session(pages, base_domain);
+    sheets.push(issues_sheet_from(&findings));
+    sheets.extend(severity_sheets_from(&findings));
     sheets
 }
 
@@ -149,6 +152,11 @@ pub fn session_sheets(pages: &[PageData], base_domain: Option<&str>) -> Vec<Shee
         ]);
 
         for link in &page.anchor_links {
+            // Cloudflare email-protection hrefs are injected by the CDN; the
+            // origin site never authored them, so keep them out of reports.
+            if crate::crawler::url_normalizer::is_platform_artifact(&link.href) {
+                continue;
+            }
             let is_external = link.href.starts_with("http")
                 && base_domain.is_some_and(|d| !link.href.contains(d));
             let row = vec![
@@ -410,19 +418,46 @@ pub fn keywords_sheet(pages: &[PageData]) -> Sheet {
 
 /// The issue audit as a sheet: severity, issue, count, sample URLs.
 pub fn issues_sheet(pages: &[PageData], base_domain: Option<&str>) -> Sheet {
-    let findings = IssueAnalyzer::analyze_session(pages, base_domain);
+    issues_sheet_from(&IssueAnalyzer::analyze_session(pages, base_domain))
+}
 
+fn issues_sheet_from(findings: &[IssueFinding]) -> Sheet {
     let mut sheet = Sheet::new("Issues", &["Severity", "Issue", "Count", "Sample URLs"]);
     for finding in findings {
         let sample: Vec<String> = finding.urls.iter().take(10).cloned().collect();
         sheet.push(vec![
             finding.severity.as_str().to_string(),
-            finding.name,
+            finding.name.clone(),
             finding.count.to_string(),
             sample.join(" | "),
         ]);
     }
     sheet
+}
+
+/// Per-severity flat sheets: **every** flagged item in full, one row per
+/// detail line (the Issues sheet only shows up to ten sample URLs). These
+/// give the GUI its Critical/Warnings/Notices tabs and exports the complete
+/// list.
+fn severity_sheets_from(findings: &[IssueFinding]) -> Vec<Sheet> {
+    let mut sheets = Vec::new();
+    for (severity, name) in [
+        (IssueSeverity::Critical, "Critical"),
+        (IssueSeverity::Warning, "Warnings"),
+        (IssueSeverity::Notice, "Notices"),
+    ] {
+        let mut sheet = Sheet::new(name, &["Issue", "Detail"]);
+        for finding in findings
+            .iter()
+            .filter(|finding| finding.severity == severity)
+        {
+            for detail in &finding.urls {
+                sheet.push(vec![finding.name.clone(), detail.clone()]);
+            }
+        }
+        sheets.push(sheet);
+    }
+    sheets
 }
 
 /// Extensions that mark a link as a downloadable file (not an HTML page).

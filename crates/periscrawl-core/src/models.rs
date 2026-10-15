@@ -15,7 +15,6 @@ pub struct AppSettings {
     pub ui: UiConfig,
     pub system: SystemConfig,
     pub connectors: ConnectorsConfig,
-    pub provider: LLMprovider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,8 +80,6 @@ pub struct SystemConfig {
 pub struct ConnectorsConfig {
     pub pagespeed: PageSpeedConfig,
     pub search_console: SearchConsoleConfig,
-    pub gemini: GeminiConfig,
-    pub openai: OpenAiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -109,24 +106,6 @@ pub struct SearchConsoleConfig {
     pub token: String,
     pub project_id: String,
     pub project_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GeminiConfig {
-    pub api_key: String,
-    pub model: String,
-    pub status: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct OpenAiConfig {
-    pub api_key: String,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LLMprovider {
-    pub llm: String,
 }
 
 impl Default for AppSettings {
@@ -164,9 +143,6 @@ impl Default for AppSettings {
                 export_format: "csv".to_string(),
             },
 
-            provider: LLMprovider {
-                llm: "Not selected".to_string(),
-            },
             connectors: ConnectorsConfig {
                 pagespeed: PageSpeedConfig {
                     api_key: "".to_string(),
@@ -176,15 +152,6 @@ impl Default for AppSettings {
                     token: "".to_string(),
                     project_id: "".to_string(),
                     project_name: "".to_string(),
-                },
-                gemini: GeminiConfig {
-                    api_key: "".to_string(),
-                    model: "gemini-pro".to_string(),
-                    status: false,
-                },
-                openai: OpenAiConfig {
-                    api_key: "".to_string(),
-                    model: "gpt-4-turbo".to_string(),
                 },
             },
         }
@@ -206,12 +173,6 @@ impl AppSettings {
             Self::default()
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ChatLog {
-    pub role: String,
-    pub content: String,
 }
 
 #[derive(Debug, Clone)]

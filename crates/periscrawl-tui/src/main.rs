@@ -407,46 +407,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                             continue;
                         }
 
-                        // MODAL PRIORITY 1: AI Chat Modal
-                        if app.show_ai_modal {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => app.show_ai_modal = false,
-                                KeyCode::Enter => {
-                                    if let Err(e) = app.submit_ai_message().await {
-                                        app.logs_data.push(format!("AI Error: {}", e));
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    app.ai_input.pop();
-                                }
-                                KeyCode::Char(c) => {
-                                    app.ai_input.push(c);
-                                }
-                                KeyCode::PageUp => {
-                                    app.ai_chat_auto_scroll = false;
-                                    if app.ai_chat_scroll > 0 {
-                                        app.ai_chat_scroll = app.ai_chat_scroll.saturating_sub(5);
-                                    }
-                                }
-                                KeyCode::PageDown => {
-                                    app.ai_chat_auto_scroll = false;
-                                    app.ai_chat_scroll += 5;
-                                }
-                                KeyCode::Up => {
-                                    app.ai_chat_auto_scroll = false;
-                                    if app.ai_chat_scroll > 0 {
-                                        app.ai_chat_scroll -= 1;
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    app.ai_chat_auto_scroll = false;
-                                    app.ai_chat_scroll += 1;
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
                         // MODAL PRIORITY 2: Details Modal
                         if app.show_details {
                             match key.code {
@@ -1039,7 +999,6 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                             KeyCode::Char('s') => app.set_sidebar_tab(4), // Settings
                             KeyCode::Char('f') => app.set_sidebar_tab(2),
                             KeyCode::Char('a') => app.set_sidebar_tab(3),
-                            KeyCode::Char('A') => app.toggle_ai_modal(),
                             // KeyCode::Char('b') | KeyCode::Char('+') => app.set_sidebar_tab(4),
                             KeyCode::Char('L') => app.toggle_logs(),
                             // Number jumps

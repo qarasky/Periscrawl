@@ -4,7 +4,6 @@
 //! egui or any other UI toolkit. The CLI, GUI and TUI crates are thin layers on
 //! top of it.
 
-pub mod ai;
 pub mod audit;
 pub mod content_audit;
 pub mod crawler;

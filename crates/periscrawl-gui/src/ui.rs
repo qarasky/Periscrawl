@@ -631,10 +631,31 @@ fn click_target_for(sheet_name: &str, row: &[String]) -> Option<ClickTarget> {
     match sheet_name {
         // severity | issue | count | sample urls
         "Issues" => row.get(1).map(|issue| ClickTarget::Issue(issue.clone())),
+        // issue | detail — open the first page mentioned in the detail line
+        // (e.g. "source -> target (status)" opens the source page).
+        "Critical" | "Warnings" | "Notices" => {
+            row.get(1).and_then(|detail| first_url(detail)).map(ClickTarget::Page)
+        }
         // ID | URL | ...
         "Overview" => row.get(1).map(|url| ClickTarget::Page(url.clone())),
         // page | target | ...
         _ => row.first().map(|url| ClickTarget::Page(url.clone())),
+    }
+}
+
+/// First absolute URL inside a detail line. Handles all detail formats the
+/// analyzers produce: "url", "url (7 images)", "source -> target (404 …)".
+fn first_url(text: &str) -> Option<String> {
+    let start = text.find("http")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches([',', ';']);
+    if url.len() > 8 {
+        Some(url.to_string())
+    } else {
+        None
     }
 }
 
@@ -1230,22 +1251,24 @@ fn live_view(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
 // ---------------------------------------------------------------------------
 
 /// Circular gauges above the sheet tabs: green = good, yellow = mid, red =
-/// bad, with the value and a label inside each ring.
-fn stat_rings(app: &PeriscrawlApp, ui: &mut egui::Ui) {
+/// bad, with the value and a label inside each ring. Clicking a ring opens
+/// the matching tab (Overview / Critical / Warnings / Notices / CWV).
+fn stat_rings(app: &mut PeriscrawlApp, ui: &mut egui::Ui) {
     if app.summaries.is_empty() {
         return;
     }
-    let total = app.summaries.len() as f32;
+    let page_total = app.summaries.len();
+    let total = page_total as f32;
     let ok_pages = app
         .summaries
         .iter()
         .filter(|summary| summary.status.starts_with('2'))
-        .count() as f32;
+        .count();
     let indexable = app
         .summaries
         .iter()
         .filter(|summary| !summary.indexability.to_lowercase().contains("noindex"))
-        .count() as f32;
+        .count();
 
     let (mut critical, mut warning, mut notice) = (0usize, 0usize, 0usize);
     for finding in &app.findings {
@@ -1271,70 +1294,105 @@ fn stat_rings(app: &PeriscrawlApp, ui: &mut egui::Ui) {
         }
     }
 
-    let ok_ratio = ok_pages / total;
-    let indexable_ratio = indexable / total;
+    let ok_ratio = ok_pages as f32 / total;
+    let indexable_ratio = indexable as f32 / total;
+    let mut open_tab: Option<&'static str> = None;
     ui.horizontal(|ui| {
-        ring(
+        if ring(
             ui,
             ok_ratio,
             &format!("{:.0}%", ok_ratio * 100.0),
             "Pages OK",
             ratio_color(ok_ratio, 0.95, 0.8),
-            &format!("{} of {} pages answered 2xx/3xx", ok_pages as usize, app.summaries.len()),
-        );
-        ring(
+            &format!("{ok_pages} of {page_total} pages answered 2xx/3xx — click to open the Overview tab"),
+        )
+        .clicked()
+        {
+            open_tab = Some("Overview");
+        }
+        if ring(
             ui,
             indexable_ratio,
             &format!("{:.0}%", indexable_ratio * 100.0),
             "Indexable",
             ratio_color(indexable_ratio, 0.9, 0.6),
-            "Pages without a noindex directive (meta robots / header)",
-        );
-        ring(
+            "Pages without a noindex directive (meta robots / header) — click to open the Overview tab",
+        )
+        .clicked()
+        {
+            open_tab = Some("Overview");
+        }
+        if ring(
             ui,
             (critical as f32 / 50.0).min(1.0),
             &critical.to_string(),
             "Critical",
             if critical > 0 { ERR_RED } else { OK_GREEN },
-            "Critical issue occurrences (broken links, redirects to error, 404s…)",
-        );
-        ring(
+            "Critical issue occurrences — click to open the full Critical list",
+        )
+        .clicked()
+        {
+            open_tab = Some("Critical");
+        }
+        if ring(
             ui,
             (warning as f32 / 50.0).min(1.0),
             &warning.to_string(),
             "Warnings",
             if warning > 0 { WARN_YELLOW } else { OK_GREEN },
-            "Warning-level issues (titles, descriptions, alt text, CWV…)",
-        );
-        ring(
+            "Warning-level issues — click to open the full Warnings list",
+        )
+        .clicked()
+        {
+            open_tab = Some("Warnings");
+        }
+        if ring(
             ui,
             (notice as f32 / 50.0).min(1.0),
             &notice.to_string(),
             "Notices",
             if notice > 0 { Color32::from_gray(150) } else { OK_GREEN },
-            "Informational findings (length hints, non-critical polish)",
-        );
+            "Informational findings — click to open the full Notices list",
+        )
+        .clicked()
+        {
+            open_tab = Some("Notices");
+        }
         if cwv_count > 0 {
             let average = cwv_sum / cwv_count as f32;
-            ring(
+            if ring(
                 ui,
                 average / 100.0,
                 &format!("{average:.0}"),
                 "CWV score",
                 ratio_color(average / 100.0, 0.9, 0.5),
-                &format!("Average PageSpeed score across {cwv_count} sampled runs (desktop + mobile)"),
-            );
-        } else {
-            ring(
-                ui,
-                0.0,
-                "–",
-                "CWV score",
-                Color32::from_gray(110),
-                "No PageSpeed data in this session (enable the connector and re-crawl)",
-            );
+                &format!("Average PageSpeed score across {cwv_count} sampled runs — click to open the CWV tab"),
+            )
+            .clicked()
+            {
+                open_tab = Some("CWV");
+            }
+        } else if ring(
+            ui,
+            0.0,
+            "–",
+            "CWV score",
+            Color32::from_gray(110),
+            "No PageSpeed data in this session (enable the connector and re-crawl) — opens the CWV tab",
+        )
+        .clicked()
+        {
+            open_tab = Some("CWV");
         }
     });
+
+    if let Some(name) = open_tab {
+        if let Some(index) = app.sheets.iter().position(|sheet| sheet.name == name) {
+            app.active_tab = CentralTab::Sheet(index);
+            app.active_sort = None;
+            app.filter.clear();
+        }
+    }
 }
 
 fn ratio_color(ratio: f32, good: f32, mid: f32) -> Color32 {
@@ -1348,6 +1406,7 @@ fn ratio_color(ratio: f32, good: f32, mid: f32) -> Color32 {
 }
 
 /// One circular gauge: background ring, value arc, number + label inside.
+/// Returns the response so callers can make it clickable.
 fn ring(
     ui: &mut egui::Ui,
     fraction: f32,
@@ -1355,10 +1414,13 @@ fn ring(
     label: &str,
     color: Color32,
     hover: &str,
-) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(80.0, 80.0), egui::Sense::hover());
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(80.0, 80.0), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
-        return;
+        return response;
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let center = rect.center();
     let radius = 29.0;
@@ -1394,7 +1456,7 @@ fn ring(
         Color32::from_gray(170),
     );
 
-    response.on_hover_text(hover);
+    response.on_hover_text(hover)
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,36 +1551,6 @@ fn settings_window(app: &mut PeriscrawlApp, ctx: &egui::Context) {
                     ui.checkbox(
                         &mut draft.connectors.pagespeed.status,
                         "Collect CWV (sampled: nav pages + one per template)",
-                    );
-                    ui.end_row();
-
-                    ui.label("Gemini API key");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.connectors.gemini.api_key)
-                            .password(true)
-                            .desired_width(340.0),
-                    );
-                    ui.end_row();
-
-                    ui.label("Gemini model");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.connectors.gemini.model)
-                            .desired_width(340.0),
-                    );
-                    ui.end_row();
-
-                    ui.label("OpenAI API key");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.connectors.openai.api_key)
-                            .password(true)
-                            .desired_width(340.0),
-                    );
-                    ui.end_row();
-
-                    ui.label("OpenAI model");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.connectors.openai.model)
-                            .desired_width(340.0),
                     );
                     ui.end_row();
                 });
